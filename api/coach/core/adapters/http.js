@@ -152,12 +152,14 @@ export function httpAdapter(spec) {
     },
 
     /**
-     * One question, one answer. `env` carries the key under the provider's declared variable
-     * and nothing else is read from it; `fetch` is injectable so the phone can route through
-     * native HTTP and a test can hand in a fake.
+     * One request and its parsed JSON answer, with the transport's rules: the key from `env`,
+     * a bounded wait, the retry on statuses the provider itself calls transient, and one
+     * classification of failures (see the table at the top). `makeBody(model)` builds the body.
+     * Returns { code:0, data } or the { code, text, stderr, ... } failure shape invoke returns.
+     * It is what a tool loop calls once per turn.
      */
-    async invoke(opts = {}) {
-      const { cfg, prompt, system, schema, env, model, timeoutMs = DEFAULT_TIMEOUT_MS, maxTokens = MAX_OUTPUT_TOKENS, fetch: fetchImpl = globalThis.fetch, signal } = opts;
+    async exchange(opts, makeBody) {
+      const { cfg, env, model, timeoutMs = DEFAULT_TIMEOUT_MS, fetch: fetchImpl = globalThis.fetch, signal } = opts;
       const base = adapter.baseUrl(cfg);
       if (!base) return { code: -1, text: '', stderr: `no endpoint configured for ${id}`, spawnError: true };
       const key = keyOf(env);
@@ -165,7 +167,7 @@ export function httpAdapter(spec) {
       const chosen = model || meta.defaultModel;
       if (!chosen) return { code: 1, text: '', stderr: `no model chosen for ${id} (pick one from the list the endpoint serves)` };
 
-      let body = spec.body({ model: chosen, prompt, system: system || null, schema: schema || null, maxTokens });
+      let body = makeBody(chosen);
       let retriedWithoutJsonMode = false;
       let transientRetries = 0;
       for (;;) {
@@ -196,12 +198,24 @@ export function httpAdapter(spec) {
           }
           return { code: 1, text: '', stderr: `${res.status} ${trim(msg, 280)}` };
         }
-        let out;
-        try { out = spec.readText(data); } catch (e) { out = { error: `unexpected response shape: ${trim(e.message, 100)}` }; }
-        if (out.error) return { code: 1, text: '', stderr: out.error };
-        if (out.truncated) return { code: 1, text: '', stderr: 'the answer was cut off at the output limit; try a smaller plan or a bigger model' };
-        return { code: 0, text: String(out.text || '').trim(), stderr: '' };
+        return { code: 0, data, text };
       }
+    },
+
+    /**
+     * One question, one answer. `env` carries the key under the provider's declared variable
+     * and nothing else is read from it; `fetch` is injectable so the phone can route through
+     * native HTTP and a test can hand in a fake.
+     */
+    async invoke(opts = {}) {
+      const { prompt, system, schema, maxTokens = MAX_OUTPUT_TOKENS } = opts;
+      const r = await adapter.exchange(opts, chosen => spec.body({ model: chosen, prompt, system: system || null, schema: schema || null, maxTokens }));
+      if (r.code !== 0) return r;
+      let out;
+      try { out = spec.readText(r.data); } catch (e) { out = { error: `unexpected response shape: ${trim(e.message, 100)}` }; }
+      if (out.error) return { code: 1, text: '', stderr: out.error };
+      if (out.truncated) return { code: 1, text: '', stderr: 'the answer was cut off at the output limit; try a smaller plan or a bigger model' };
+      return { code: 0, text: String(out.text || '').trim(), stderr: '' };
     }
   };
   return adapter;

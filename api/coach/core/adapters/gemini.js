@@ -1,7 +1,9 @@
 /* Google Gemini (Generative Language API). The key travels as a header, never as `?key=` —
  * a query string ends up in proxy logs, error messages and browser history. */
 import { httpAdapter } from './http.js';
-import { SYSTEM_PROMPT } from '../system-prompt.js';
+// These providers only answer one-shot requests (the connection test); the assistant needs a
+// tool loop, which they do not run. See adapters/index.js.
+const SYSTEM_PROMPT = 'You are the openGym assistant. Answer briefly.';
 
 export const geminiSpec = {
   id: 'gemini',

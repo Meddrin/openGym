@@ -1,9 +1,9 @@
 /* The four HTTPS providers, driven with a fake fetch.
  *
  * What is asserted is the request each one puts on the wire — URL, headers, body — and how
- * every way a call can go wrong lands in the { code, text, stderr } contract the pipeline
- * classifies. The classification itself is asserted through the real pipeline, so a change
- * to its regex and a change to an adapter's stderr cannot drift apart without a red build.
+ * every way a call can go wrong lands in the { code, text, stderr } contract the job runner
+ * classifies (jobs.test.js drives the classification itself end to end). Anthropic also runs
+ * the assistant's tool loop, asserted at the bottom.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,9 +14,9 @@ const anthropic = (await import('../coach/core/adapters/anthropic.js')).default;
 const openai = (await import('../coach/core/adapters/openai.js')).default;
 const gemini = (await import('../coach/core/adapters/gemini.js')).default;
 const compatible = (await import('../coach/core/adapters/compatible.js')).default;
-const { attemptOnce } = await import('../coach/core/pipeline.js');
 const { HTTP_PROVIDERS, validateBaseUrl, validateHeaders } = await import('../coach/core/providers.js');
-const { SYSTEM_PROMPT } = await import('../coach/core/system-prompt.js');
+// What the providers that only answer one-shot requests (the connection test) say as their system turn.
+const SYSTEM_PROMPT = 'You are the openGym assistant. Answer briefly.';
 
 /** A fetch that records what it was asked and answers from a script. Like the real one, it
  *  refuses an already-aborted signal without putting anything on the wire. */
@@ -35,7 +35,7 @@ function fakeFetch(answers) {
 const ok = body => ({ status: 200, body });
 const env = { ANTHROPIC_API_KEY: 'sk-ant-1', OPENAI_API_KEY: 'sk-oa-1', GEMINI_API_KEY: 'AIza-1', OPENAI_COMPAT_API_KEY: 'compat-1' };
 const cfgCompat = { provider: 'compatible', providerOptions: { compatible: { baseUrl: 'http://ollama.lan:11434/' } } };
-const ANSWER = '{"coach_contract":1,"nochange":true,"reading":"fine"}';
+const ANSWER = 'a short answer';
 
 test('the four HTTP adapters spawn nothing and need no runtime', () => {
   for (const a of [anthropic, openai, gemini, compatible]) {
@@ -45,19 +45,20 @@ test('the four HTTP adapters spawn nothing and need no runtime', () => {
   }
 });
 
-test('Anthropic: /v1/messages with the key in a header, the shared system prompt, and the text joined back', async () => {
-  const f = fakeFetch([ok({ content: [{ type: 'text', text: '{"a":' }, { type: 'text', text: '1}' }], stop_reason: 'end_turn' })]);
-  const r = await anthropic.invoke({ cfg: {}, prompt: 'P', env, model: null, fetch: f });
+test('Anthropic: /v1/messages with the key in a header, the rules as the cached system block, and the text joined back', async () => {
+  const f = fakeFetch([ok({ content: [{ type: 'text', text: 'one ' }, { type: 'text', text: 'two' }], stop_reason: 'end_turn' })]);
+  const r = await anthropic.invoke({ cfg: {}, prompt: 'P', system: 'RULES', env, model: null, fetch: f });
   assert.equal(r.code, 0);
-  assert.equal(r.text, '{"a":1}');
+  assert.equal(r.text, 'one two');
   const c = f.calls[0];
   assert.equal(c.url, 'https://api.anthropic.com/v1/messages');
   assert.equal(c.headers['x-api-key'], 'sk-ant-1');
   assert.equal(c.headers['anthropic-version'], '2023-06-01');
   assert.equal(c.headers['anthropic-dangerous-direct-browser-access'], 'true');
   assert.equal(c.body.model, HTTP_PROVIDERS.anthropic.defaultModel);
-  assert.equal(c.body.system, SYSTEM_PROMPT);
+  assert.deepEqual(c.body.system, [{ type: 'text', text: 'RULES', cache_control: { type: 'ephemeral' } }]);
   assert.deepEqual(c.body.messages, [{ role: 'user', content: 'P' }]);
+  assert.equal(c.body.tools, undefined, 'a one-shot call offers no tools');
   assert.ok(c.body.max_tokens >= 8000);
   assert.ok(!c.url.includes('sk-ant'), 'the key is never in the URL');
 });
@@ -216,19 +217,14 @@ test('a missing key is "missing", like an absent CLI — no request is made', as
   const r = await anthropic.invoke({ cfg: {}, prompt: 'P', env: {}, fetch: f });
   assert.equal(r.spawnError, true);
   assert.equal(f.calls.length, 0);
-  const cls = await attemptOnce({ adapter: anthropic, cfg: {}, kind: 'review', payload: { plan: { routines: [], week: {} } }, invokeOpts: { env: {}, fetch: f } }, null);
-  assert.equal(cls.errorClass, 'missing');
 });
 
-test('401 and 403 reach the pipeline as "auth"; other statuses as "provider"', async () => {
-  const payload = { plan: { routines: [], week: {} } };
-  for (const [status, expect] of [[401, 'auth'], [403, 'auth'], [429, 'provider'], [500, 'provider']]) {
+test('an HTTP error status is code 1 with the status leading stderr — what the job runner classifies as auth or provider', async () => {
+  for (const status of [401, 403, 429, 500]) {
     const f = fakeFetch([{ status, body: { error: { message: 'nope' } } }]);
     const r = await openai.invoke({ cfg: {}, prompt: 'P', env, fetch: f, retryDelayMs: 0 });
     assert.equal(r.code, 1);
     assert.ok(r.stderr.startsWith(String(status)), `stderr starts with the status: ${r.stderr}`);
-    const cls = await attemptOnce({ adapter: openai, cfg: {}, kind: 'review', payload, invokeOpts: { env, fetch: f, retryDelayMs: 0 } }, null);
-    assert.equal(cls.errorClass, expect, `${status} → ${expect}`);
   }
 });
 
@@ -273,20 +269,17 @@ test('a body that is not JSON on an error still yields a readable stderr', async
   assert.match(r.stderr, /^502 .*bad gateway/);
 });
 
-test('an answer cut off at the output limit fails as "provider", not as a half-parsed proposal', async () => {
+test('an answer cut off at the output limit is a failure, not a half answer', async () => {
   const cases = [
-    [anthropic, ok({ content: [{ type: 'text', text: '{"coach_contract":1,"changes":[' }], stop_reason: 'max_tokens' })],
-    [openai, ok({ choices: [{ message: { content: '{"coach_contract":1,"changes":[' }, finish_reason: 'length' }] })],
-    [gemini, ok({ candidates: [{ content: { parts: [{ text: '{"coach_contract":1,' }] }, finishReason: 'MAX_TOKENS' }] })]
+    [anthropic, ok({ content: [{ type: 'text', text: 'half an ans' }], stop_reason: 'max_tokens' })],
+    [openai, ok({ choices: [{ message: { content: 'half an ans' }, finish_reason: 'length' }] })],
+    [gemini, ok({ candidates: [{ content: { parts: [{ text: 'half an ans' }] }, finishReason: 'MAX_TOKENS' }] })]
   ];
   for (const [adapter, answer] of cases) {
     const f = fakeFetch([answer]);
     const r = await adapter.invoke({ cfg: {}, prompt: 'P', env, model: 'm', fetch: f });
     assert.equal(r.code, 1, adapter.id);
     assert.match(r.stderr, /cut off/, adapter.id);
-    const cls = await attemptOnce({ adapter, cfg: {}, kind: 'review', payload: { plan: { routines: [], week: {} } }, invokeOpts: { env, fetch: f } }, null);
-    assert.equal(cls.errorClass, 'provider', adapter.id);
-    assert.equal(cls.repairable, undefined, 'the repair round is not spent on a truncated answer');
   }
 });
 
@@ -312,8 +305,6 @@ test('a fetch that throws names the host; an abort is a timeout', async () => {
   const hang = (url, init) => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))));
   const t = await openai.invoke({ cfg: {}, prompt: 'P', env, timeoutMs: 20, fetch: hang });
   assert.equal(t.timedOut, true);
-  const cls = await attemptOnce({ adapter: openai, cfg: {}, kind: 'review', payload: { plan: { routines: [], week: {} } }, timeoutMs: 20, invokeOpts: { env, fetch: hang } }, null);
-  assert.equal(cls.errorClass, 'timeout');
 });
 
 test('models(): each list shape is read, sorted, and Gemini is filtered to generateContent', async () => {
@@ -442,4 +433,60 @@ test('validateHeaders: small maps pass, framing names and junk do not', () => {
   assert.equal(validateHeaders([['a', 'b']]).ok, false);
   const many = {}; for (let i = 0; i < 9; i++) many['x-h-' + i] = 'v';
   assert.equal(validateHeaders(many).ok, false);
+});
+
+/* ---------- the Anthropic tool loop ---------- */
+
+const fakeToolset = () => {
+  const ran = [];
+  return {
+    ran,
+    tools: [
+      { name: 'get_profile', description: 'who', params: {}, run: () => ({}) },
+      { name: 'list_workouts', description: 'workouts', params: { limit: { type: 'integer', optional: true, min: 1, max: 60 } }, run: () => ({}) }
+    ],
+    call(name, args) { ran.push([name, args]); return name === 'get_profile' ? { unit: 'kg' } : { error: 'boom' }; }
+  };
+};
+const toolUse = (id, name, input) => ({ type: 'tool_use', id, name, input });
+
+test('Anthropic tool loop: the model asks, the toolset answers, the loop ends in text', async () => {
+  const ts = fakeToolset();
+  const f = fakeFetch(n => n === 1
+    ? ok({ content: [{ type: 'text', text: 'let me look' }, toolUse('t1', 'get_profile', {}), toolUse('t2', 'list_workouts', { limit: 3 })], stop_reason: 'tool_use' })
+    : ok({ content: [{ type: 'text', text: 'You train in kg.' }], stop_reason: 'end_turn' }));
+  const r = await anthropic.invoke({ cfg: {}, prompt: 'P', system: 'RULES', tools: ts, env, fetch: f });
+  assert.equal(r.code, 0);
+  assert.equal(r.text, 'You train in kg.');
+  assert.equal(f.calls.length, 2);
+  // Turn one offered exactly the toolset's tools, with JSON schemas built from their parameters.
+  assert.deepEqual(f.calls[0].body.tools.map(t => t.name), ['get_profile', 'list_workouts']);
+  assert.deepEqual(f.calls[0].body.tools[1].input_schema, {
+    type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 60 } }
+  });
+  // Turn two carried the assistant's tool_use blocks and one tool_result per call, errors flagged.
+  const second = f.calls[1].body.messages;
+  assert.equal(second[1].role, 'assistant');
+  assert.equal(second[2].role, 'user');
+  assert.deepEqual(second[2].content.map(b => [b.type, b.tool_use_id, !!b.is_error]), [['tool_result', 't1', false], ['tool_result', 't2', true]]);
+  assert.equal(second[2].content[0].content, '{"unit":"kg"}');
+  assert.deepEqual(ts.ran, [['get_profile', {}], ['list_workouts', { limit: 3 }]]);
+});
+
+test('Anthropic tool loop: a model that never stops asking runs out of turns, and an error ends it at once', async () => {
+  const forever = fakeFetch(() => ok({ content: [toolUse('t', 'get_profile', {})], stop_reason: 'tool_use' }));
+  const r = await anthropic.invoke({ cfg: {}, prompt: 'P', tools: fakeToolset(), env, fetch: forever });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /used up its turns/);
+  assert.equal(forever.calls.length, 12);
+
+  const down = fakeFetch([{ status: 401, body: { error: { message: 'bad key' } } }]);
+  const e = await anthropic.invoke({ cfg: {}, prompt: 'P', tools: fakeToolset(), env, fetch: down });
+  assert.equal(e.code, 1);
+  assert.ok(e.stderr.startsWith('401'));
+});
+
+test('only Anthropic among the HTTPS providers runs the tool loop', () => {
+  assert.equal(anthropic.tools, true);
+  for (const a of [openai, gemini, compatible]) assert.notEqual(a.tools, true, a.id);
 });

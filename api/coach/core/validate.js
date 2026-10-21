@@ -1,14 +1,14 @@
-/* The gate between a language model's output and someone's training plan.
+/* The gate between a language model's plan changes and someone's training plan.
  *
- * Everything upstream of here is advisory — the prompt asks for a shape, the model usually
- * obliges. This file is where "usually" stops mattering. Nothing reaches a user that has not
- * resolved against the real exercise library, matched the closed list of change types, and
- * stayed inside the two things the Coach is allowed to touch (routines and the week).
+ * Everything upstream of here is advisory — the tool description asks for a shape, the model
+ * usually obliges. This file is where "usually" stops mattering. Nothing reaches a user that has
+ * not resolved against the real exercise library, matched the closed list of change types, and
+ * targeted a routine or exercise that is really in the plan.
  *
- * That closed list is the actual security boundary of the feature. A hostile note in a user's
- * free text can talk the model into saying anything at all; it cannot invent a change type,
- * and a change type that does not exist here does nothing. `parse.js` answers "is there JSON
- * in what the provider said"; this file is the only thing that answers "is it safe to act on".
+ * That closed list is a security boundary of the feature. A hostile note in a user's free text
+ * can talk the model into saying anything at all; it cannot invent a change type, and a change
+ * type that does not exist here does nothing. core/changes.js routes the plan family here and
+ * checks the other kinds itself.
  *
  * Errors are collected rather than thrown one at a time, because they are fed back to the
  * model verbatim for the one repair round (FR-48) — and a list of six problems produces a
@@ -48,7 +48,7 @@ const MAX_SPEED = 60;
 const RESERVED_IDS = ['__proto__', 'constructor', 'prototype'];
 const safeId = v => isStr(v) && !RESERVED_IDS.includes(v);
 const MAX_CHANGES = 25;
-const MAX_ROUTINES = 7;
+const MAX_ROUTINES = 30;
 const MAX_EX_PER_ROUTINE = 20;
 
 const isStr = v => typeof v === 'string' && v.trim().length > 0;
@@ -76,163 +76,6 @@ const ODD_PER_SIDE = where =>
   `${where} is a per-side exercise, so reps are the total across both sides and must be an even number`;
 const INVERTED_RANGE = where =>
   `${where} sets a rep ceiling below its own floor — repsMax must be at least repsMin`;
-
-/* =============================== created plans =============================== */
-
-/**
- * Validate a creation bundle into something `mergePlan` can consume unchanged.
- * Returns { ok, bundle } or { ok:false, errors }.
- */
-export function validatePlan(data, ctx = {}) {
-  const errors = [];
-  if (!data || typeof data !== 'object') return fail(['the answer was not an object']);
-  if (data.nochange) return fail(['a plan was requested but the answer said "no change"']);
-  if (!Array.isArray(data.routines) || !data.routines.length) {
-    // A review-style change list where a plan was asked for (#471): say what the task wants,
-    // so the repair round sends the plan rather than the same list again.
-    errors.push(Array.isArray(data.changes)
-      ? 'this task needs the complete plan (week and every routine with its ex), not a list of changes — start from refine.previous when revising, apply what was asked, and send the whole plan'
-      : 'routines must be a non-empty array');
-  }
-
-  // A custom id that shadows a library id is the one case where the screen and the plan
-  // disagree: the approval card resolves the id against the catalogue and shows that exercise,
-  // while mergePlan remaps it to the model's invention. Whatever was approved is not applied.
-  (Array.isArray(data.customEx) ? data.customEx : []).forEach((c, i) => {
-    if (c && isStr(c.id) && libraryHas(c.id)) errors.push(`customEx[${i}].id "${c.id}" is already a library exercise id — give your own exercises their own ids`);
-  });
-  const customEx = (Array.isArray(data.customEx) ? data.customEx : [])
-    .filter(c => c && safeId(c.id) && !libraryHas(c.id) && isStr(c.n))
-    .slice(0, 20)
-    .map(c => ({ id: clampStr(c.id, 40), n: clampStr(c.n, 60), bp: clampStr(c.bp || 'waist', 30), ...(c.desc ? { desc: clampStr(c.desc, 400) } : {}) }));
-  // Ids the plan may name: invented in this same answer, or already the user's own.
-  const proposedIds = new Set([...customEx.map(c => c.id), ...(ctx.customIds || [])]);
-
-  const routines = [];
-  (Array.isArray(data.routines) ? data.routines : []).slice(0, MAX_ROUTINES).forEach((r, ri) => {
-    if (!r || typeof r !== 'object') { errors.push(`routines[${ri}] is not an object`); return; }
-    if (!isStr(r.name)) errors.push(`routines[${ri}].name is required`);
-    if (r.prog != null && !POLICIES.includes(r.prog)) errors.push(`routines[${ri}].prog "${r.prog}" is not one of ${POLICIES.join(', ')}`);
-    const ex = [];
-    (Array.isArray(r.ex) ? r.ex : []).slice(0, MAX_EX_PER_ROUTINE).forEach((e, ei) => {
-      const where = `routines[${ri}].ex[${ei}]`;
-      if (!e || !isStr(e.id)) { errors.push(`${where}.id is required`); return; }
-      // FR-16: an id that resolves to nothing invalidates the proposal rather than being
-      // dropped into a plan that renders blank the first time it is trained.
-      if (!libraryHas(e.id) && !proposedIds.has(e.id)) {
-        errors.push(`${where}.id "${e.id}" is not in the exercise library and is not one of your own customEx entries — use an id from the library provided in the payload`);
-        return;
-      }
-      if (offEquipment(ctx, e.id)) { errors.push(OFF_EQUIPMENT(`${where}.id`, e.id)); return; }
-      const clean = { id: e.id, sets: isInt(e.sets, 1, 10) ? e.sets : 3 };
-      const mode = MODES.includes(e.mode) ? e.mode : 'reps';
-      const perSide = !!e.side;
-      if (mode === 'cardio') {
-        clean.min = isInt(e.min, 1, 180) ? e.min : 20;
-        clean.speed = isNum(e.speed) && e.speed > 0 && e.speed <= MAX_SPEED ? e.speed : 8;
-      } else if (mode === 'time') {
-        clean.mode = 'time';
-        clean.sec = isInt(e.sec, 5, 3600) ? e.sec : 45;
-        if (isNum(e.weight) && e.weight > 0 && e.weight <= MAX_WEIGHT) clean.weight = e.weight;
-      } else {
-        clean.mode = 'reps';
-        clean.reps = isInt(e.reps, 1, 100) ? e.reps : 10;
-        if (perSide && clean.reps % 2) { errors.push(ODD_PER_SIDE(`${where}.reps`)); return; }
-        if (isNum(e.weight) && e.weight > 0 && e.weight <= MAX_WEIGHT) clean.weight = e.weight;
-      }
-      if (e.prog != null) {
-        if (!POLICIES.includes(e.prog)) errors.push(`${where}.prog "${e.prog}" is not one of ${POLICIES.join(', ')}`);
-        else clean.prog = e.prog;
-      }
-      if (isNum(e.inc) && e.inc > 0 && e.inc <= MAX_INC) clean.inc = e.inc;
-      if (isInt(e.repsMin, 1, 100)) clean.repsMin = e.repsMin;
-      // The ceiling that makes bodyweight progression terminate (upstream #33): reaching it
-      // adds a set and restarts the reps. Without it the Coach can neither see nor prescribe
-      // how a push-up is meant to get harder.
-      if (isInt(e.repsMax, 1, 100)) clean.repsMax = e.repsMax;
-      // Triple progression's set ceiling (frontend/src/lib/progression.js tripleSetsOf).
-      if (isInt(e.setsMax, 1, 10)) clean.setsMax = e.setsMax;
-      if (clean.repsMax != null && clean.repsMin != null && clean.repsMax < clean.repsMin) {
-        errors.push(INVERTED_RANGE(where)); return;
-      }
-      // Written out only when the plan disagrees with the catalogue, matching plan-share.js —
-      // an absent flag means "whatever the exercise says", which is what every plan written
-      // before these existed relies on.
-      if (e.bodyweight != null) clean.bodyweight = !!e.bodyweight;
-      if (perSide) clean.side = true;
-      if (isStr(e.sg)) clean.sg = clampStr(e.sg, 20);
-      if (isStr(e.why)) clean.why = clampStr(e.why, 400);
-      // The same exercise twice in one routine has no honest reading: `reorder` can never be
-      // satisfied again (it demands each id once), and every targeted change resolves to
-      // whichever copy comes first.
-      if (ex.some(x => x.id === clean.id)) {
-        errors.push(`${where}.id "${e.id}" appears twice in "${r.name || ri}" — list each exercise once`);
-        return;
-      }
-      ex.push(clean);
-    });
-    if (!ex.length) errors.push(`routines[${ri}] has no valid exercises`);
-    // Two routines answering to one id make the week ambiguous: `known` is a Set, so the day
-    // validates while pointing at either of them.
-    const rid = safeId(r.id) ? clampStr(r.id, 40) : 'r' + ri;
-    if (routines.some(x => x.id === rid)) {
-      errors.push(`routines[${ri}].id "${rid}" is already used by another routine in this plan`);
-      return;
-    }
-    routines.push({
-      id: rid,
-      name: clampStr(r.name || 'Routine', 40),
-      emoji: glyphStr(r.emoji),
-      ...(POLICIES.includes(r.prog) ? { prog: r.prog } : {}),
-      ...(isStr(r.why) ? { why: clampStr(r.why, 400) } : {}),
-      ex
-    });
-  });
-
-  // The week may only point at routines this bundle actually defines.
-  const known = new Set(routines.map(r => r.id));
-  const week = {};
-  Object.entries(data.week || {}).forEach(([d, rid]) => {
-    const day = +d;
-    if (!isInt(day, 0, 6)) { errors.push(`week key "${d}" is not a weekday number 0-6`); return; }
-    if (!known.has(rid)) { errors.push(`week[${d}] points at "${rid}", which is not one of the routines in this plan`); return; }
-    week[day] = rid;
-  });
-
-  // FR-20: never start someone above what they have actually lifted.
-  const caps = new Map((ctx.workingWeights || []).map(w => [w.id, w.best]));
-  routines.forEach(r => r.ex.forEach(e => {
-    if (e.weight == null) return;
-    const cap = caps.get(e.id);
-    // No cap for THIS exercise means they have never lifted it, whether or not they have
-    // lifted anything else. Either way the number is invented, and create.md already tells the
-    // model to omit it: drop it and let the first session set the baseline, like the app does.
-    if (cap == null) delete e.weight;
-    else if (e.weight > cap) e.weight = cap;
-  }));
-
-  // FR-17: honour the number of training days the user asked for.
-  const want = ctx.daysPerWeek;
-  // An absent week used to slip through: the plan then schedules nothing at all, which is not
-  // the number of days anyone asked for either.
-  if (isInt(want, 1, 7) && Object.keys(week).length !== want) {
-    errors.push(`the week schedules ${Object.keys(week).length} days but ${want} were asked for`);
-  }
-
-  if (errors.length) return fail(errors);
-  return {
-    ok: true,
-    bundle: {
-      opengym_plan: 1,
-      name: clampStr(data.name || 'Coach plan', 40),
-      summary: clampStr(data.summary || '', 1200),
-      basedOn: clampStr(data.basedOn || '', 400),
-      week, routines, customEx
-    }
-  };
-}
-
-/* =============================== review change-sets =============================== */
 
 /**
  * Validate a review answer. Returns { ok, nochange } | { ok, proposal } | { ok:false, errors }.
@@ -334,7 +177,7 @@ export function validateReview(data, plan, ctx = {}) {
           dropDuplicate(ALREADY_IN(where, c, routine), where, c); return;
         }
         const a = c.after || {};
-        if (!isStr(a.id) || !knownEx(a.id)) { errors.push(`${where}.after.id must be an exercise id from the library`); return; }
+        if (!isStr(a.id) || !knownEx(a.id)) { errors.push(`${where}.after.id "${a.id}" is not in the exercise library or your own exercises — find a real id with search_exercises`); return; }
         if (offEquipment(ctx, a.id)) { errors.push(OFF_EQUIPMENT(`${where}.after.id`, a.id)); return; }
         const perSide = !!a.side;
         if (perSide && isInt(a.reps, 1, 100) && a.reps % 2) { errors.push(ODD_PER_SIDE(`${where}.after.reps`)); return; }
@@ -363,7 +206,7 @@ export function validateReview(data, plan, ctx = {}) {
           dropDuplicate(ALREADY_IN(where, c, routine), where, c); return;
         }
         const a = c.after || {};
-        if (!isStr(a.id) || !knownEx(a.id)) { errors.push(`${where}.after.id must be an exercise id from the library`); return; }
+        if (!isStr(a.id) || !knownEx(a.id)) { errors.push(`${where}.after.id "${a.id}" is not in the exercise library or your own exercises — find a real id with search_exercises`); return; }
         if (offEquipment(ctx, a.id)) { errors.push(OFF_EQUIPMENT(`${where}.after.id`, a.id)); return; }
         if (a.id === target.exId) { errors.push(`${where} swaps an exercise for itself`); return; }
         out.after = {
@@ -556,7 +399,7 @@ export function validateReview(data, plan, ctx = {}) {
     const have = (routines.get(rid)?.ex || []).length;
     if (have + n > MAX_EX_PER_ROUTINE) errors.push(`routine "${routines.get(rid)?.name || rid}" would end up with ${have + n} exercises, more than the ${MAX_EX_PER_ROUTINE} allowed`);
   });
-  if (routines.size + addedRoutines - removedRoutines.size > MAX_ROUTINES) {
+  if (addedRoutines && routines.size + addedRoutines - removedRoutines.size > MAX_ROUTINES) {
     errors.push(`the plan would end up with more than the ${MAX_ROUTINES} routines allowed`);
   }
 
@@ -617,34 +460,3 @@ function currentOf(type, routine, planned, plan, target) {
 }
 
 function fail(errors) { return { ok: false, errors }; }
-
-/* =============================== workout debriefs =============================== */
-
-const DEBRIEF_LISTS = ['highlights', 'watch', 'nextTime'];
-const MAX_DEBRIEF_ITEMS = 5;
-
-/**
- * Validate a debrief — a reading of one session with nothing to apply. Strings and short lists
- * only: the closed list of change types does not apply because a debrief cannot carry a change
- * at all, and one that tries is refused rather than trimmed.
- * Returns { ok, proposal:{ summary, score, highlights, watch, nextTime } } | { ok:false, errors }.
- */
-export function validateDebrief(data) {
-  if (!data || typeof data !== 'object') return fail(['the answer was not an object']);
-  const errors = [];
-  if (data.nochange) errors.push('a debrief was requested — "nochange" is not an answer here; read the session and say what you saw');
-  if (Array.isArray(data.changes) && data.changes.length) errors.push('a debrief carries no plan changes — drop "changes" and put advice into "nextTime"');
-  if (!isStr(data.summary)) errors.push('summary is required — two or three sentences on how the session went');
-  let score = null;
-  if (typeof data.score === 'number' && Number.isFinite(data.score)) score = Math.max(1, Math.min(10, Math.round(data.score)));
-  else errors.push('score must be a whole number from 1 to 10');
-  const lists = {};
-  DEBRIEF_LISTS.forEach(k => {
-    const v = data[k];
-    if (v != null && !Array.isArray(v)) { errors.push(`${k} must be an array of short strings`); lists[k] = []; return; }
-    lists[k] = (v || []).filter(isStr).map(x => clampStr(x.trim(), 300)).slice(0, MAX_DEBRIEF_ITEMS);
-  });
-  if (!DEBRIEF_LISTS.some(k => lists[k].length)) errors.push('at least one of highlights, watch or nextTime must have an item');
-  if (errors.length) return fail(errors);
-  return { ok: true, proposal: { summary: clampStr(data.summary.trim(), 600), score, ...lists } };
-}

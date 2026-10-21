@@ -1,4 +1,4 @@
-/* The provider adapters, and the four options that make the Claude one safe.
+/* The provider adapters, and the options that make the Claude one safe.
  *
  * These assertions are deliberately about the object the adapter passes to the SDK rather than
  * about observed model behaviour: the point is that re-enabling a tool is a red build, and a
@@ -10,7 +10,9 @@ import { tempData } from './helpers.mjs';
 
 tempData();
 const { adapterFor, default: ADAPTERS } = await import('../coach/adapters/index.js');
-const { LOCKDOWN } = await import('../coach/adapters/claude.js');
+const claudeMod = await import('../coach/adapters/claude.js');
+const { LOCKDOWN, ALLOWED_TOOLS, BUILTIN_TOOLS, MCP_SERVER, MAX_TURNS, queryOptions, zodShape } = claudeMod;
+const { TOOL_NAMES, createToolset } = await import('../coach/assistant/tools.js');
 const { argvFor } = await import('../coach/adapters/codex.js');
 const cfg = await import('../coach/config.js');
 
@@ -22,14 +24,97 @@ test('every provider the config offers has an adapter, and vice versa', () => {
 
 test('the Claude adapter is locked out of every tool the SDK could give it', () => {
   // `tools: []` is the SDK's documented "disable all built-in tools" — no Read, no Bash, no
-  // Grep — and the other three stop anything on the host widening that afterwards. If one of
-  // these ever has to change, it should be a decision with a diff, not a default that drifted.
+  // Grep, no WebFetch — and the others stop anything on the host widening that afterwards, or a
+  // prompt for permission ever being waited on. If one of these ever has to change, it should
+  // be a decision with a diff, not a default that drifted.
   assert.deepEqual(LOCKDOWN.tools, [], 'no built-in tools');
   assert.deepEqual(LOCKDOWN.settingSources, [], 'no settings files may be loaded');
   assert.deepEqual(LOCKDOWN.skills, [], 'no skills may be loaded');
   assert.equal(LOCKDOWN.strictMcpConfig, true, 'no MCP server may arrive from ambient config');
   assert.equal(LOCKDOWN.persistSession, false, 'no session history is written anywhere');
-  assert.equal(LOCKDOWN.maxTurns, 1, 'one turn: a job is a question, not a conversation');
+  assert.equal(LOCKDOWN.permissionMode, 'dontAsk', 'nothing is ever asked — unlisted tools are denied');
+  assert.equal(LOCKDOWN.maxTurns, MAX_TURNS);
+  assert.ok(MAX_TURNS >= 8 && MAX_TURNS <= 16, 'a handful of lookups, a proposal, a fix and the answer — not an open-ended loop');
+});
+
+const fakeServer = { type: 'sdk', name: MCP_SERVER, instance: {} };
+const baseArgs = { mcpServer: fakeServer, env: { PATH: '/bin', HOME: '/tmp/j' }, model: 'm', cwd: '/tmp/j', abortController: new AbortController(), stderr() {}, spawnClaudeCodeProcess() {} };
+
+test('the assistant job allows only the openGym tools, through one in-process server', () => {
+  const o = queryOptions(baseArgs);
+  // Exactly the nine tools, spelled the way the SDK spells an MCP tool — nothing built in.
+  assert.deepEqual([...o.allowedTools].sort(), TOOL_NAMES.map(n => `mcp__${MCP_SERVER}__${n}`).sort());
+  assert.deepEqual(o.allowedTools, [...ALLOWED_TOOLS]);
+  for (const t of o.allowedTools) assert.match(t, /^mcp__opengym__[a-z_]+$/);
+  assert.deepEqual(Object.keys(o.mcpServers), [MCP_SERVER], 'the one server we built, no other');
+  assert.equal(o.mcpServers[MCP_SERVER], fakeServer);
+  // No built-in can be among the allowed, and every common one is also named as refused.
+  for (const b of ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'Task', 'Skill']) {
+    assert.ok(!o.allowedTools.includes(b), `${b} is not allowed`);
+    assert.ok(o.disallowedTools.includes(b), `${b} is refused by name too`);
+  }
+  assert.deepEqual(o.disallowedTools, [...BUILTIN_TOOLS]);
+  assert.equal(o.tools.length, 0);
+  assert.equal(o.permissionMode, 'dontAsk');
+  assert.equal(o.maxTurns, MAX_TURNS);
+  assert.equal(o.persistSession, false);
+  assert.deepEqual(o.settingSources, []);
+  assert.equal(o.strictMcpConfig, true);
+  assert.equal(typeof o.spawnClaudeCodeProcess, 'function', 'the unprivileged spawn is still the one used');
+  assert.ok(o.systemPrompt.includes('propose_changes'), 'the assistant prompt is the system prompt');
+});
+
+test('a round trip with no tools gets no server, no allowed tools and a single turn', () => {
+  const o = queryOptions({ ...baseArgs, mcpServer: null });
+  assert.deepEqual(o.allowedTools, []);
+  assert.deepEqual(o.mcpServers, {});
+  assert.equal(o.maxTurns, 1);
+});
+
+test('the job environment is the one built from nothing, plus the client name and no more', () => {
+  const env = { PATH: '/bin', HOME: '/tmp/j', TMPDIR: '/tmp/j', ANTHROPIC_API_KEY: 'k' };
+  const o = queryOptions({ ...baseArgs, env });
+  assert.deepEqual(Object.keys(o.env).sort(), [...Object.keys(env), 'CLAUDE_AGENT_SDK_CLIENT_APP'].sort());
+  assert.match(o.env.CLAUDE_AGENT_SDK_CLIENT_APP, /^opengym-coach\//);
+  // …and config.jobEnv really is built from nothing: none of the server's own variables leak in.
+  process.env.RP_ID = 'secret.example'; process.env.ADMIN_UIDS = 'a,b'; process.env.VAPID_PRIVATE_KEY = 'vapid';
+  cfg.save({ enabled: true, provider: 'claude' });
+  const built = cfg.jobEnv('/tmp/j', { ok: true, type: 'apikey', auth: { token: 'tok' } });
+  for (const k of ['RP_ID', 'ADMIN_UIDS', 'VAPID_PRIVATE_KEY', 'DATA_DIR']) assert.equal(built[k], undefined, k);
+  assert.equal(built.ANTHROPIC_API_KEY, 'tok');
+  assert.equal(queryOptions({ ...baseArgs, env: built }).env.RP_ID, undefined);
+});
+
+test('the tool server really is built from the toolset, and its handlers run the same code', async t => {
+  let m;
+  try { m = { ...(await import('@anthropic-ai/claude-agent-sdk')), z: (await import('zod')).z }; } catch { return t.skip('the Agent SDK is not installed here'); }
+  const S = { unit: 'lb', routines: [], workouts: [], bodyweight: [], customEx: [] };
+  const toolset = createToolset({ uid: 'u1', readState: uid => (uid === 'u1' ? S : null) });
+  const server = claudeMod.buildServer(m, toolset);
+  assert.equal(server.type, 'sdk');
+  const reg = server.instance._registeredTools;
+  assert.deepEqual(Object.keys(reg).sort(), [...TOOL_NAMES].sort());
+  const out = await reg.get_profile.handler({}, {});
+  assert.equal(JSON.parse(out.content[0].text).unit, 'lb');
+  assert.equal(out.isError, false);
+  const bad = await reg.get_workout.handler({ id: 'nope' }, {});
+  assert.equal(bad.isError, true);
+});
+
+test('a tool parameter spec becomes the zod shape the SDK takes', async t => {
+  let z;
+  try { z = (await import('zod')).z; } catch { return t.skip('zod is not installed here'); }
+  const shape = zodShape(z, {
+    a: { type: 'string', description: 'd' },
+    b: { type: 'integer', optional: true, min: 1, max: 5 },
+    c: { type: 'string', enum: ['x', 'y'] },
+    d: { type: 'array' }
+  });
+  const schema = z.object(shape);
+  assert.ok(schema.safeParse({ a: 's', c: 'x', d: [{ any: 1 }] }).success);
+  assert.ok(!schema.safeParse({ a: 's', b: 9, c: 'x', d: [] }).success, 'max is enforced');
+  assert.ok(!schema.safeParse({ a: 's', c: 'z', d: [] }).success, 'enum is enforced');
+  assert.ok(!schema.safeParse({ c: 'x', d: [] }).success, 'required is enforced');
 });
 
 test('an image built without the AI runtime reports it rather than crashing', async () => {
@@ -85,9 +170,22 @@ test('a configured model is appended, and nothing else is', () => {
   assert.equal(argvFor('o4-mini').length, argvFor(null).length + 2);
 });
 
+test('which adapters can run the assistant is stated, and agrees with what the config says', () => {
+  const can = Object.entries(ADAPTERS).filter(([, a]) => a.tools === true).map(([id]) => id).sort();
+  assert.deepEqual(can, ['anthropic', 'claude', 'fixture']);
+  for (const id of ['codex', 'openai', 'gemini', 'compatible']) assert.notEqual(ADAPTERS[id].tools, true, id);
+  // The config's public block tells the screens, so they can name the provider the assistant needs.
+  for (const id of ['claude', 'anthropic', 'codex', 'openai']) {
+    cfg.reset(); cfg.save({ enabled: true, provider: id });
+    if (cfg.isConnected()) assert.equal(cfg.publicConfig().assistant, ADAPTERS[id].tools === true, id);
+  }
+});
+
 test('every adapter states whether it spawns a process — the privilege gate reads that, not an absence', () => {
   for (const [id, a] of Object.entries(ADAPTERS)) assert.equal(typeof a.spawns, 'boolean', `${id}.spawns`);
-  for (const id of ['fixture', 'claude', 'codex']) assert.equal(ADAPTERS[id].spawns, true, id);
+  for (const id of ['claude', 'codex']) assert.equal(ADAPTERS[id].spawns, true, id);
+  // The fixture is in-process: there is no model to sandbox.
+  assert.equal(ADAPTERS.fixture.spawns, false);
   for (const id of ['anthropic', 'openai', 'gemini', 'compatible']) {
     assert.equal(ADAPTERS[id].spawns, false, id);
     assert.equal(cfg.PROVIDERS[id].http, true, id);
