@@ -18,7 +18,7 @@ vi.mock('./api.js', () => ({ api: vi.fn() }))
 vi.mock('../store/useStore.js', () => ({ useStore: { getState: () => ({ S: {}, coachLocal: mocks.coachLocal }) } }))
 vi.mock('../store/useUI.js', () => ({ useUI: { getState: () => ({ toast: vi.fn() }) } }))
 
-const { JOB_ERRORS, BYOK_ERRORS, jobErrorText } = await import('./coach-api.js')
+const { JOB_ERRORS, BYOK_ERRORS, ASSISTANT_ERRORS, jobErrorText } = await import('./coach-api.js')
 const { setLang, getLang, LANGS, DERIVED_LOCALES } = await import('./i18n.js')
 
 const PACKS = Object.fromEntries(Object.entries(import.meta.glob('../locales/*.js', { eager: true }))
@@ -117,8 +117,9 @@ describe('every refusal the server sends has a line here', () => {
     const block = routes.match(/const USER_ERROR = \{([\s\S]*?)\n\};/)?.[1]
     expect(block).toBeTruthy()
     const classes = [...block.matchAll(/^\s*(\w+):/gm)].map(m => m[1])
-    expect(classes).toEqual(expect.arrayContaining(['off', 'busy', 'cap', 'consent', 'shared', 'unprivileged']))
-    for (const cls of classes.filter(c => c !== 'shared')) expect(Object.keys(JOB_ERRORS), cls).toContain(cls)
+    expect(classes).toEqual(expect.arrayContaining(['off', 'busy', 'tools', 'cap', 'consent', 'shared', 'unprivileged']))
+    // The classes the assistant added have lines of their own, which no locale pack is held to yet.
+    for (const cls of classes.filter(c => c !== 'shared')) expect([...Object.keys(JOB_ERRORS), ...Object.keys(ASSISTANT_ERRORS)], cls).toContain(cls)
   })
 
   it('the unprivileged line says what the server says, in the app\'s voice', () => {

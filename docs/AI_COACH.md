@@ -1,37 +1,43 @@
 # The AI Coach
 
-An optional AI that **designs** a training plan and **revises it from what you actually log**,
-running on your own server under your own provider account, off until an admin turns it on.
+An optional **assistant** inside openGym: a chat that answers questions about training, technique
+and food, looks things up in your own data to do it, and — when you ask, or when a change clearly
+follows — **proposes edits** to your plan, your logged workouts, your body weight, your exercise
+notes and own exercises, your settings and your coach profile. It runs on your own server under your
+own provider account, off until an admin turns it on.
 
-> This document grows with the feature, which lands across a sequence of PRs. Anything described
-> here that has not reached your instance yet is visibly absent rather than broken — the Coach
-> only appears at all once an admin has enabled it and a runtime can be reached.
+It never edits anything itself. A proposal arrives as a card with a before and an after for each
+change and the assistant's reason; you apply it with one tap, and undo it with one tap.
+
+> Before v1.5 the Coach was a set of fixed jobs that returned one JSON document (build a plan,
+> review the last weeks, debrief a workout). Those jobs, their prompts, the repair round, the
+> scheduled review and the mandatory intake are gone; the assistant replaces them. The intake
+> answers remain as optional context it can read and propose edits to (**Coach menu → Edit my coach
+> profile**).
 
 ---
 
-## Two kinds of provider
+## Which providers can run it
 
-The Coach can be driven by two kinds of thing, and which kind you pick decides how much of the
-rest of this document applies to you.
+The assistant is a **tool loop**: the model asks to look something up, the server answers from one
+profile's data, and the loop ends when the model answers in prose. Only two providers run one.
 
-| Provider | What runs | Credential | Image |
-| --- | --- | --- | --- |
-| **Anthropic API** | plain HTTPS to `api.anthropic.com` | an API key | default |
-| **OpenAI API** | plain HTTPS to `api.openai.com` | an API key | default |
-| **Google Gemini** | plain HTTPS to `generativelanguage.googleapis.com` | an API key | default |
-| **OpenAI-compatible endpoint** | plain HTTPS to a URL you give it — Ollama, LM Studio, vLLM, OpenRouter, a gateway of your own | an API key, optional | default |
-| **Claude (Anthropic)** | the Claude Agent SDK, inside the container | a `claude setup-token` | `coach` |
-| **Codex (OpenAI)** | the Codex CLI, inside the container | Codex's own device sign-in | `coach` |
+| Provider | What runs | Credential | Image | Assistant |
+| --- | --- | --- | --- | --- |
+| **Claude (Anthropic)** | the Claude Agent SDK, inside the container, with an in-process tool server | a `claude setup-token`, or an API key | `coach` | yes |
+| **Anthropic API** | plain HTTPS to `api.anthropic.com`, the tool loop over the Messages API | an API key | default | yes |
+| OpenAI API, Google Gemini, OpenAI-compatible endpoint | plain HTTPS | an API key (optional for an endpoint) | default | **no** |
+| Codex (OpenAI) | the Codex CLI, inside the container | Codex's own device sign-in | `coach` | **no** |
 
-The first four spawn nothing. A job is one HTTPS request from the api process, so there is no
-child process to drop privileges on, no runtime to carry in the image, and nothing to install:
-**they work on the image every instance already has.** The `coach` image, the unprivileged
-`coach` user and the `./coach-auth` mount described further down exist for the last two only.
+An instance on a provider that cannot run the assistant is not broken, it is plain about it: the
+admin card says so on the provider step, `GET /api/config` carries `coach.assistant: false`, the
+Coach screen shows which provider it needs instead of a chat, and a message is refused with 409
+`tools` before anything is spent. The connection test still works for all of them.
 
-A model on your own LAN is the compatible endpoint with no key: point it at
-`http://ollama.lan:11434` and pick a model from the list it serves. That is the whole
-configuration. (On the server, that is. The phone app's own-key Coach needs `https://`; see
-[On the phone](#on-the-phone).)
+The HTTPS providers spawn nothing: a job is one `fetch` from the api process (or a few, for a tool
+loop), so there is no child process to drop privileges on and nothing to install: **the Anthropic
+API works on the image every instance already has.** The `coach` image, the unprivileged `coach`
+user and the `./coach-auth` mount described further down exist for the runtime-backed providers.
 
 ## Turning it on
 
@@ -41,8 +47,7 @@ enabling the Coach is a decision you make in the app.
 ### Where people find it
 
 The Coach has one door: the **Coach** entry in the **Plan** menu (the button in the top-right
-corner of the Plan header, last entry: *Plan design and reviews, from your own training*), which
-opens the chat. Up to v1.3.9 it was a card at the top of Plan. The phone app also has
+corner of the Plan header), which opens the chat. Up to v1.3.9 it was a card at the top of Plan. The phone app also has
 **Settings → AI Coach**, where the phone chooses between your server's Coach and a key of its
 own (see [On the phone](#on-the-phone)).
 
@@ -63,15 +68,15 @@ The entry appears only when all of these hold:
 The admin's own app shows the change as soon as the admin card saves it. Everyone else's app
 picks it up the next time it is opened or reloaded.
 
-### With an API key (Anthropic, OpenAI, Gemini, compatible)
+### With an API key (the Anthropic API; the others for a connection test)
 
-**1. Get a key** from the provider's own console. For a compatible endpoint, get the URL it
-answers on instead, and a key only if it wants one.
+**1. Get a key** from the provider's own console.
 
 **2. Connect it.** In the app: **Settings → Account → Admin dashboard**, the **AI Coach** card.
 
 - Toggle the card on.
-- Pick the provider chip.
+- Pick the provider chip. Only **Anthropic API** (and Claude, below) can run the assistant; the
+  others can be filed and tested, and the card says plainly that they cannot chat.
 - For a compatible endpoint, enter the **Endpoint** — `http://` or `https://`, no username or
   password in it, no query string. The host is written into the job log so you can see where
   jobs went. Paste the base the way the provider documents it: a bare host
@@ -84,66 +89,46 @@ answers on instead, and a key only if it wants one.
   calls. `Authorization` and `Content-Type` are refused there — auth framing always wins.
 - **Use an API key** → paste it. It is encrypted into `./data/coach.json` and is never shown
   again.
-- **List models** asks the endpoint what it serves and turns the model field into a picker.
-  Each provider has a starting default (it is in `api/coach/core/providers.js`, and it is a
-  starting point, not a pin — names go stale, the list does not); the compatible endpoint has
-  none, because it serves whatever you put behind it.
+- **List models** asks the provider what it serves and turns the model field into a picker. Each
+  provider has a starting default (it is in `api/coach/core/providers.js`, and it is a starting
+  point, not a pin — names go stale, the list does not).
 - **Test the Coach** — a real round trip with no user data anywhere near it.
 
-The card says two things worth reading: which account is being spent, and — for these
-providers — that jobs run no child process at all, so the privilege-drop line reads as not
-applicable rather than as a problem.
+For an OpenAI-compatible endpoint the card also takes an **Endpoint** and optional **Extra
+headers**, as before; they only matter for the connection test, because that provider cannot run
+the assistant.
 
-**3. Use it.** Each person opens **Plan → Coach**, agrees to the consent screen — which lists
-exactly what leaves the server, generated from the same module that builds payloads — and
-answers a short intake, one question per screen: goal, experience, days per week, session
-length, equipment, limitations. From then on the Coach is a chat. The answers are its first
-message; while a job runs a typing bubble shows the elapsed time; the proposal arrives as a
-card with a tab per routine and a reason under every change; free text below it asks for a
-refinement, a button applies it. Coming back later, asking for a review of what was logged
-since, or changing an answer all happen in the same conversation. Users cannot switch the
-Coach off themselves — only the admin can, from the card above.
+The card says two things worth reading: which account is being spent, and — for these providers —
+that jobs run no child process at all, so the privilege-drop line reads as not applicable rather
+than as a problem.
 
-A key, a model and the account binding described below belong to the provider they were
-entered for. Switching chips does not clear them: the Anthropic key is still there when you
-come back from trying Gemini, and each chip shows a mark when it holds one.
+**3. Use it.** Each person opens **Plan → Coach**. The first thing they see is the consent screen,
+which lists the categories of data the assistant can reach, generated from the same module the
+tools are bound to, and says that nothing is sent up front. Agreeing opens the chat:
 
-#### Picking and changing models
+- Ask anything. The assistant answers in prose (markdown, rendered safely: no raw HTML ever
+  reaches the page) in the language you write in, and shows how long it has been thinking.
+- Ask it to change something. It looks the ids up, checks the change against your data, and
+  answers with a card: each change with before and after and a one-sentence reason. **Apply**
+  runs the whole set on your device as ordinary local edits (so the sync carries them);
+  **Dismiss** throws it away; **Undo** puts back exactly what it touched.
+- The thread lives on the server, in the profile's own Coach record, so a reply that arrives while
+  the app is closed is there when it opens, and every device reads the same conversation. It keeps
+  the last 60 messages and is bounded in bytes; older proposals shrink to a summary of what they
+  were and what became of them. Forgetting the Coach deletes it.
+- Users cannot switch the Coach off themselves — only the admin can, from the card above.
 
-The model field is never a guess: **List models** asks the endpoint what it actually serves.
-For an Ollama box that means the admin decides what exists — `ollama pull` anything the
-hardware can hold and it appears in the picker on the next refresh; nothing in openGym pins
-you to a blessed list. The choice is remembered **per provider**, so trying a cloud model for
-a week and coming back to the local one restores exactly what was set before.
+A key, a model and the account binding described below belong to the provider they were entered
+for. Switching chips does not clear them: the Anthropic key is still there when you come back from
+trying another provider, and each chip shows a mark when it holds one.
 
-#### Performance on a small box
+#### The output ceiling
 
-The Coach's rules ride as a byte-identical system prompt, so a llama.cpp/Ollama endpoint can
-keep them in its prefix cache and only ever re-process the payload — and the api warms that
-cache itself at boot and every half hour, so the expensive first read happens off everyone's
-clock. Measured on a 4-core, no-GPU VM with `qwen2.5:3b`: a review costs about **a minute**
-warm, versus ~8 minutes before the cache and slimmer payload existed. Three things keep it
-that way:
-
-- `OLLAMA_KEEP_ALIVE=-1` and `OLLAMA_NUM_PARALLEL=1` on the Ollama side — an unloaded model
-  takes its cache with it, and parallel slots split it.
-- Give the container room. A ~3B model at Q4 lives happily in 4 GB; a 4B model squeezed into
-  the same limit does not fail, it *thrashes* — weights fall out of the page cache and
-  generation drops to ~1 token/s. On a 4–6 GB box, smaller and comfortable wins.
-- The endpoint is sent a **JSON schema** with each request (structured outputs), so the shape
-  of the answer is enforced while it is generated and the repair round is rarely needed.
-  Servers that reject schemas get plain JSON mode automatically, then no JSON mode — the
-  validator is the gate either way.
-
-#### When a plan comes back cut off
-
-Every answer has a ceiling on how much the provider may write, set on **Settings → Admin
-dashboard → AI Coach → Advanced → Max output tokens** (16000 by default). A reasoning model — a
-DeepSeek V3/R1-class endpoint, or a "thinking" Gemini or OpenAI model — counts its hidden
-reasoning against that same ceiling, so a `create` or `refine` can be cut off even though the
-plan itself is short. If a job fails with *"the answer was cut off at the output limit"*, raise
-it; keep it within the model's own output limit (65536 on most current hosted models, lower on a
-small local one).
+Every answer has a ceiling on how much the provider may write, set on **Settings → Admin dashboard
+→ AI Coach → Advanced → Max output tokens** (16000 by default). A "thinking" model counts its
+hidden reasoning against that same ceiling, so an answer can be cut off even when it is short. If
+a message fails with *"the answer was cut off at the output limit"*, raise it; keep it within the
+model's own output limit.
 
 ### With a runtime in the container (Claude Agent SDK, Codex CLI)
 
@@ -177,21 +162,14 @@ here, under the same chip; the setup token is the route for a Claude subscriptio
 The card also states two things worth reading before anyone uses it: whether jobs actually run
 unprivileged, and which account is being spent.
 
-**4. Use it** — as above.
+**4. Use it** — as above. This is the provider the assistant was built around: the Agent SDK runs
+the tool loop, with only the openGym tools available to it (see
+[What the model is allowed to do](#what-the-model-is-allowed-to-do)).
 
 > **On a multi-profile instance, read [Whose account pays](#whose-account-pays) first.** An API
 > key is shared by every profile under the daily limits. A *personal* credential — a Claude Code
 > setup token — binds to the first profile that spends it and **every other profile is refused**,
 > by design: that is the right behaviour when one person's personal subscription is behind it.
-
-### A debrief of one workout
-
-**Review my last workout** (in the chat menu, or the chip above the composer) sends the Coach
-one session — as logged, with the last three times the same routine was trained, the stall
-picture for its exercises and four weeks of weigh-ins — and gets back a reading, not a plan: a
-score out of ten, what went well, what to watch, and what to do next time, each item citing the
-session's own numbers. A debrief cannot carry a change; an answer that tries is refused by the
-validator rather than trimmed. The card is kept in the Coach's history like everything else.
 
 ### Comparing with others on the instance
 
@@ -203,11 +181,11 @@ symmetric: a profile that does not share sees nothing.
 What is shown is coarse on purpose — a median across everyone sharing for sessions per week and
 for the best estimated 1RM per exercise, next to the person's own number, plus where they rank.
 An exercise appears only when three or more people train it, and nothing appears at all until
-three people share. Never a name, a body weight, a date or a single session. The same compact
-medians (always in kilograms) ride along in the payload of a review or a debrief when both
-switches are on, with the prompt told to use them for perspective only. The opt-in lives in the
-server's own per-profile record, not in synced state, so a stale device cannot flip it back on;
-switching it off removes the person from the next computation immediately.
+three people share. Never a name, a body weight, a date or a single session. The medians reach the
+person's own screen and nothing else: the assistant is not given them, and has no tool that reads
+another profile. The opt-in lives in the server's own per-profile record, not in synced state, so
+a stale device cannot flip it back on; switching it off removes the person from the next
+computation immediately.
 
 ## Whose account pays
 
@@ -257,89 +235,120 @@ archive.
 
 ## What actually leaves your server
 
-`api/coach/payload.js` is built as an allowlist: every field is copied in **by name**, nothing
-is spread and nothing is passed through, so a field added to the state blob next year cannot
-ride along by accident. The five categories it can send — the same list the consent screen
-renders from, so the screen cannot drift from the payload — are:
+Nothing is sent up front. The assistant gets the conversation (the last twenty turns, each cut to
+1500 characters, with what became of any proposal in them), today's date, the app language and the
+weight unit, and then **asks for what a question needs, one tool call at a time**. Every tool is
+bound to one uid when the job is created and reads that profile's state file, read-only. No tool
+takes a uid, a path or a file name (`api/test/assistant-tools.test.js` asserts it by looking at
+every parameter), so a model that is talked into asking for somebody else's data has nothing to
+ask with, and the state reader is only ever asked for the one uid.
+
+`api/coach/core/payload.js` still cuts what a tool returns: every field is copied in **by name**,
+bounded by type and length, nothing is spread, so a field added to the state blob next year cannot
+ride along by accident. The categories a tool can return — the same list the consent screen
+renders from, so the screen cannot drift from what can leave — are:
 
 | Category | What it covers |
 | --- | --- |
-| `plan` | routines, exercises, sets/reps, schedule, progression settings |
-| `training` | logged sets, targets, effort ratings, durations, PRs and session notes in the review window |
-| `bodyweight` | weigh-ins in the window and your goal weight |
-| `profile` | the intake answers you gave the Coach, including any limitations |
-| `cohort` (optional) | only with comparison on and your own opt-in: anonymous medians from the other people sharing — never their data, and never yours to them beyond the same medians |
-| `prefs` | unit, language, effort scale |
+| `plan` | routines, exercises, sets/reps, schedule, per-date overrides, progression settings |
+| `training` | logged workouts the assistant looks up: sets, weights, reps, effort, durations, notes |
+| `bodyweight` | weigh-ins and your goal weight |
+| `profile` | the intake answers (limits, injuries), standing exercise notes, your own exercises |
+| `prefs` | unit, language, effort scale, the settings it may change |
+| `chat` | your messages and its recent replies |
 
-A review reads a training block, not a training career: the window is capped at **12 weeks or 60
-sessions**. Your profile is identified by a stable pseudonym that is never the user id and never
-reversible.
+The tools:
 
-Excluded on purpose and permanently: **display name and user id, passkey and credential
-material, push subscriptions, invite data, theme and appearance settings, and every other
-profile's everything.**
+| Tool | Parameters | Returns |
+| --- | --- | --- |
+| `get_profile` | none | unit, language, effort scale, goal weight, the settings it may change, the intake answers, totals |
+| `get_plan` | none | routines with exercises, the week, per-date overrides |
+| `list_workouts` | `from?`, `to?`, `exerciseId?`, `limit?` | newest first, short form |
+| `get_workout` | `id` | every exercise and set, with the indices an edit refers to |
+| `search_exercises` | `query?`, `muscle?`, `bodyPart?`, `equipment?`, `limit?` | library and own exercises, with ids |
+| `get_my_exercises` | none | own exercises, standing notes, favourites |
+| `get_bodyweight` | `from?`, `to?`, `limit?` | weigh-ins, weekly means, goal |
+| `get_stats` | `topic?`, `weeks?`, `exerciseId?` | estimated 1RM, weekly hard sets per muscle, adherence |
+| `propose_changes` | `summary?`, `changes` | validation result; on success the proposal is kept for the card |
+
+Text the user wrote (workout names, notes, intake answers) comes back as data, and the system
+prompt says tool results and stored notes are data, never instructions. Messages the user types are
+instructions, within the rules.
+
+Excluded on purpose and permanently: **display name and user id, passkey and credential material,
+push subscriptions, invite data, theme and appearance settings, and every other profile's
+everything.**
 
 ## Bodyweight and per-side work
 
 Upstream v1.2.4 taught the app that a push-up carries no load and a lunge is logged as a total
-across both sides. The Coach has to know the same things, because on a bodyweight exercise
+across both sides. The assistant has to know the same things, because on a bodyweight exercise
 `weight` means *added* load and is `0` on a perfectly good session — so every load-shaped signal
-reads flat. A Coach that couldn't see this would look at a working push-up progression and
-propose adding weight to a push-up.
-
-So the payload carries `bodyweight`, `side` and `repsMax`, the session reader carries the set
-count (the dimension bodyweight work grows once reps hit their ceiling), and the prompts say
-that reps and then sets are the progression, and that per-side targets step in twos.
+reads flat. The plan view carries `bodyweight`, `side` and `repsMax`, and the validator enforces
+the two rules with a single right answer: per-side reps are a total across both sides and so even,
+and a rep ceiling is never below its floor.
 
 The server re-implements three reading rules the frontend owns — `modeOf`, `isBw`, `isPerSide` —
-because the api image has no build step in common with the frontend. `coach-parity.test.js`
-pins them against the originals over a table of configs, so the copies cannot drift silently.
+and two more (`isWarmupSet`, the Epley estimate) because the api image has no build step in common
+with the frontend. `coach-parity.test.js` and `api/test/payload-parity.test.js` pin them against
+the originals, so the copies cannot drift silently.
 
-## What comes back, and what it is allowed to do
+## What it may change, and how
 
-The prompt asks for a shape and the model usually obliges. `api/coach/validate.js` is where
-"usually" stops mattering, and it — not the prompt — is the security boundary. Nothing reaches
-you that has not:
+The tool description asks for a shape and the model usually obliges. `api/coach/core/changes.js`
+is where "usually" stops mattering, and it — not the prompt — is a security boundary. A change set
+is **all or nothing** and nothing reaches you that has not:
 
-- **matched the closed list of change types.** Eighteen of them, each with an apply
-  implementation on the client to match. A hostile note in your own free text can talk a model
-  into saying anything at all; it cannot invent a change type, and a change type that is not on
-  the list does nothing. There is no default case anywhere.
-- **resolved against the real exercise library.** An id nobody has invalidates the whole
-  proposal rather than being quietly dropped into a plan that renders blank the first time you
-  train it.
-- **hit something that exists.** Every target names a routine in your plan, and anything about
-  an exercise names one that is actually in that routine.
-- **cited its evidence.** A change with no `why` is refused.
+- **matched the closed list of change types.** Thirty of them. A hostile note in your own free text
+  can talk a model into saying anything at all; it cannot invent a change type, and a type that is
+  not on the list does nothing.
+- **resolved against the real exercise library or your own exercises.** An id nobody has refuses
+  the whole set, with the id named and `search_exercises` suggested, rather than being quietly
+  dropped into a plan that renders blank the first time you train it.
+- **hit something that exists.** Every target names a routine, workout, weigh-in or exercise that
+  is really there, and `before` is read off your data, never taken from the model.
+- **carried sane numbers.** Reps, weights, durations, dates and settings have ranges; a logged
+  set needs something in it; a workout needs one completed working set; a date is not in the future.
+- **made sense as a whole,** applying cleanly to a throwaway copy of your state: two changes to the
+  same workout, or one that uses an exercise another deletes, are refused.
+- **cited its reason.** A change with no `why` is refused.
 
-A rejected answer gets **one** repair round, with the errors handed back verbatim. Two failures
-is a provider problem rather than a prompting problem, and a retry loop against a paid account
-is a bad way to find that out.
+The model sees the validation errors in the same job and fixes its proposal (a second successful
+call replaces the first); a model that cannot gets a plain answer and no card.
 
-A job is given five minutes by default, which is generous for any hosted API. A model running
-on a CPU behind the compatible endpoint can need more — with a warm cache a 3B model answers
-in one to a few minutes depending on the CPU (an old 4-core box manages ~12 prompt tokens/s;
-a modern one several times that), but the first job after the model loads pays the full
-prompt once — so
-`COACH_JOB_TIMEOUT_MS` in `.env` raises the budget (never below one minute); the api's own
-HTTP client waits as long as the job, and the chat says "this can take a while" rather than
-promising minutes when the endpoint is a local one. The phone's BYOK mode does the same on
-its own: a local endpoint gets 25 minutes there.
+| Kind | What |
+| --- | --- |
+| plan (18) | `add-exercise`, `remove-exercise`, `swap-exercise`, `sets`, `reps`, `repsMin`, `repsMax`, `sec`, `cardio`, `reorder`, `superset`, `routine-prog`, `exercise-prog`, `inc`, `add-routine`, `remove-routine`, `rename-routine`, `week` |
+| calendar | `dayplan`: one date's override (a routine, rest, or back to the schedule) |
+| logged workouts | `workout-add`, `workout-edit` (name, note, date, exercises and sets, by index), `workout-delete` |
+| body weight | `bodyweight-set`, `bodyweight-delete` |
+| exercises | `exnote-set` (the standing note), `custom-ex-add`, `custom-ex-edit`, `custom-ex-delete` |
+| settings | `setting` for `restSec`, `restPauseSec`, `sound`, `keepAwake`, `timedSetOvertime`, `effort`, `weekStart`, `wdec`, `targetW`, `oneRmFormula`, `speedUnit`, `equipFilterOn` |
+| intake | `profile-set` |
 
-The Coach may only touch **routines and the week**. Your training log, your weigh-ins and your
-settings are not reachable from any change type that exists.
+Not possible, by construction: the weight unit (switching it converts every logged weight, a data
+migration with its own confirmation in Settings, not something to flip inside an undoable set),
+anything about accounts, passwords, credentials, invites, other profiles or the server itself.
 
-Applying happens **on the client**, not the server — ordinary local editing, so it works
-offline, syncs like everything else, and stays reversible without the server knowing. Every
-apply takes a snapshot of `{routines, week}` first, so one tap puts the plan back; workouts are
-deliberately untouched by a revert, because the log is what happened. A change-set is
-all-or-nothing: a failure part-way through discards the whole draft rather than leaving a
-half-applied proposal.
+**Applying happens on the client**, not the server (`frontend/src/lib/coach-changes.js`). Before
+it runs, the proposal is validated again with the very same module, against your state as it is
+now; if it does not validate to exactly what was shown (a workout deleted on another device, a
+weigh-in edited since) the card says your data has changed, Apply is switched off and nothing is
+written. Apply then runs inside the store's update, whose draft is discarded if anything throws, so
+a failure part-way leaves the state exactly as it was. It is ordinary local editing: it works
+offline, syncs like everything else, and the store stamps workouts, weigh-ins, deletions and
+settings the way every other edit is stamped.
 
-Proposals carry a fingerprint of the plan they were computed against. If the plan has moved
-since — you edited it on another device, or changed by hand the exact thing a change is
-about — that change is shown greyed out with the reason, and cannot be applied. Silently
-overwriting an edit you made yourself would be the worse failure.
+Every apply first takes an undo snapshot of every top-level key it is about to touch. Small keys
+(routines, week, settings, notes) are kept whole; the lists that can be large (workouts, weigh-ins,
+own exercises) are kept per record, so editing one workout does not copy the history into your
+synced state. Undo puts the snapshot back (restored workouts and weigh-ins get a newer stamp than
+the edit they undo, so another device keeps the undo), including the personal-record badges the
+change may have granted or revoked. Only the newest apply can be undone; the last three snapshots
+are kept.
+
+A job is given five minutes by default, which is generous for any hosted API: `COACH_JOB_TIMEOUT_MS`
+in `.env` raises the budget (never below one minute).
 
 ## Isolation
 
@@ -398,24 +407,34 @@ provider that exists precisely so the loop can be walked before an account is co
 
 ## What the model is allowed to do
 
-The Claude provider runs through the Agent SDK rather than a hand-rolled CLI call, because the
-SDK exposes the switches that matter and brings its own matching runtime. Four of them are the
-reason it can be trusted next to your `./data`:
+The Claude provider runs through the Agent SDK rather than a hand-rolled CLI call, because the SDK
+exposes the switches that matter and brings its own matching runtime. The assistant's tools are an
+**in-process SDK MCP server** (`createSdkMcpServer` + `tool()`), built per job from the toolset
+above and living in the api process: the unprivileged runtime reaches them over the SDK's control
+channel and has no other way to anything. Everything else the SDK could hand a model is switched
+off, each by a documented option:
 
 | Option | Effect |
 | --- | --- |
-| `tools: []` | Disables **all** built-in tools — no Read, no Bash, no Grep. The model has no filesystem tool at all, however it is prompted. |
-| `settingSources: []` | No user/project/local settings file is loaded, so nothing on the host can widen the line above afterwards. |
+| `tools: []` | Disables **all** built-in tools — no Read, no Bash, no Grep, no WebFetch. The model has no filesystem or network tool at all, however it is prompted. |
+| `disallowedTools` | The built-ins by name, a second lock on the same door. |
+| `allowedTools` | Exactly the nine `mcp__opengym__*` tools, nothing else pre-approved. |
+| `permissionMode: 'dontAsk'` | Anything not pre-approved is denied; nothing ever prompts (there is nobody to prompt). |
+| `settingSources: []` | No user/project/local settings file is loaded, so nothing on the host can widen the lines above afterwards. |
 | `skills: []` | Same, for skills. |
-| `strictMcpConfig` | No MCP server can arrive from ambient configuration. |
+| `strictMcpConfig` | No MCP server can arrive from ambient configuration; ours is the only one. |
+| `persistSession: false` | Nothing is written to disk for the next job to find. |
+| `maxTurns: 12` | A handful of lookups, a proposal, a fix and the answer; not an open-ended loop. |
 
-They are exported as one frozen object and asserted by value in `adapters.test.js`, so
-re-enabling one is a red build rather than a quiet capability grant.
+They are exported from `api/coach/adapters/claude.js` and asserted by value in `adapters.test.js`
+(the options object a job really passes to the SDK is built by one pure function, so the test
+reads the real thing), so widening one is a red build rather than a quiet capability grant.
 
 The credential reaches the model process as an environment variable and by no other route. The
 job environment is built from nothing rather than filtered, and the SDK's `env` option *replaces*
 the child environment rather than extending it — so `RP_ID`, `ADMIN_UIDS` and the VAPID keys
-cannot reach it by inheritance even by accident.
+cannot reach it by inheritance even by accident. The Anthropic API provider runs the same loop with
+the same tools over HTTP, with the same turn budget, one overall timeout and no tools but ours.
 
 ## Where a credential lives
 
@@ -458,22 +477,20 @@ The App-Store build has no server of its own, so the Coach there is a choice mad
 
 - **Use my self-hosted openGym.** Pair the phone with your instance (the same pairing flow as
   syncing — **Settings → Account → Pair the mobile app** on the site, then the address and code on the
-  phone). A paired phone is an ordinary profile: the Coach runs on your server with whatever
+  phone). A paired phone is an ordinary profile: the assistant runs on your server with whatever
   provider the admin configured, under the rules above, and nothing on the phone changes.
-- **Bring my own API key.** The phone calls Anthropic, OpenAI, Gemini or a compatible endpoint
-  directly, with a key you paste. It runs the same payload allowlist, the same validator and
-  the same single repair round as the server, in the app. The key is kept in the platform's
-  secure storage — Keychain on iOS, the Keystore-backed store on Android — and never in the
-  app's state, so it cannot ride along in a backup, an export or a sync. You pay: the screen
-  says which host each request goes to and what leaves the device before you choose, and a
-  local daily cap stands in for the one an admin would have set.
+- **Bring my own API key.** The phone calls the **Anthropic API** directly with a key you paste, and
+  runs the same nine tools and the same tool loop as the server, in the app, over the state it
+  already holds. The conversation is kept in the phone's own device file (not in the synced state,
+  so it cannot ride along in a backup, an export or a sync). The key is kept in the platform's
+  secure storage — Keychain on iOS, the Keystore-backed store on Android — and never in the app's
+  state. You pay: the screen says which host each request goes to and what can leave the device
+  before you choose, and a local daily cap stands in for the one an admin would have set. The other
+  providers can still be filed here, but they cannot run the assistant, and the Coach screen says
+  so rather than offering a chat.
 
   A compatible endpoint has to be **`https://`** here. Android does not let apps send
-  unencrypted `http://` traffic, so a model on your LAN at `http://ollama.lan:11434` cannot be
-  reached from the phone, and the setup screen says so as soon as such an address is typed.
-  Either put HTTPS in front of the model (Tailscale's HTTPS certificates, or a reverse proxy
-  with a certificate), or use the first option: the server has no such rule, and its Coach
-  reaches an `http://` model on its own network.
+  unencrypted `http://` traffic, and the setup screen says so as soon as such an address is typed.
 
 ## Off is really off
 

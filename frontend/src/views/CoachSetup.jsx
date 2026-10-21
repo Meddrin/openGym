@@ -2,12 +2,13 @@
 //
 // Two answers. "Use my self-hosted openGym" hands the whole thing to the paired server — the
 // same Coach the web app has, with whatever provider its admin configured; the phone only has
-// to be paired. "Bring my own API key" runs the pipeline on the phone against Anthropic,
-// OpenAI, Gemini or an OpenAI-compatible endpoint, with a key that stays in secure storage.
+// to be paired. "Bring my own API key" runs the assistant on the phone against the Anthropic API,
+// with a key that stays in secure storage. The assistant is a tool loop, which only Anthropic's
+// adapter runs, so the other providers can still be tried here but are told they cannot chat.
 //
 // The promise this screen keeps: nothing AI-shaped is loaded until a mode is chosen. Its only
-// imports from the Coach core are the provider table and the five category names — the
-// catalogue, the prompts and the validator arrive through one dynamic import, behind a
+// imports from the Coach core are the provider table and the category names — the
+// catalogue, the tools and the loop arrive through one dynamic import, behind a
 // progress line that reports real steps rather than a pretend byte counter.
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -33,6 +34,8 @@ const STEPS = () => [t('Loading the exercise catalogue…'), t('Checking the end
 // refused up front with the two ways that work: HTTPS in front of the model, or the server's
 // Coach, which has no such rule and reaches http:// on its own network.
 const isCleartext = url => /^http:\/\//i.test(String(url || '').trim())
+// Only the Anthropic API can run the assistant from the phone: it needs a tool loop.
+const noChat = () => t('The assistant needs tools, which only the Anthropic API can run from this phone. Choose Anthropic, or “Use my self-hosted openGym” with a server that runs Claude.')
 const cleartextRefused = () => t('Android blocks unencrypted http:// connections from apps, so this phone can only reach an https:// endpoint. Put HTTPS in front of it (Tailscale or a reverse proxy), or choose “Use my self-hosted openGym”: your server can reach an http:// model on its own network.')
 
 export default function CoachSetup() {
@@ -62,6 +65,7 @@ export default function CoachSetup() {
   useEffect(() => { setModels(null); setModel(coachLocal?.provider === provider ? (coachLocal?.model || '') : '') }, [provider])
 
   const meta = HTTP_PROVIDERS[provider] || {}
+  const canChat = provider === 'anthropic'
   const host = hostOf(baseUrlFor(provider, { providerOptions: { [provider]: { baseUrl } } }))
   const serverHasCoach = !!(user && config?.coach?.enabled)
 
@@ -159,6 +163,7 @@ export default function CoachSetup() {
           {HTTP_PROVIDER_IDS.map(id => <button key={id} className={'chip' + (id === provider ? ' on' : '')} disabled={busy}
             onClick={() => setProvider(id)}>{HTTP_PROVIDERS[id].label}</button>)}
         </div>
+        {!canChat && <p className="sect-f" style={{ color: 'var(--yellow)', padding: '0 14px 10px', lineHeight: 1.45 }}>{noChat()}</p>}
       </Section>
 
       {meta.baseUrl && <Section title={t('Endpoint')}

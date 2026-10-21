@@ -1,156 +1,72 @@
-// The Coach, in the demo build.
+// The assistant, in the demo build.
 //
-// The GitHub Pages demo has no backend at all, so there is nothing to run a CLI and nothing
+// The GitHub Pages demo has no backend at all, so there is nothing to run a model and nothing
 // to poll. Rather than hide the feature there — it is the most interesting thing the app
-// does — the demo answers the same calls locally with a canned proposal.
+// does — the demo answers the same calls locally with a canned assistant.
 //
-// It is built from the demo profile's actual routines rather than hard-coded, so every id
-// resolves, the before/after values are real, and applying it exercises exactly the same
-// code path as a live instance: validate, snapshot, apply, log, revert. What is faked is the
-// provider, not the feature.
+// What it says is canned, what it proposes is not: each proposal is built from the demo
+// profile's actual routines and body weight and then checked by the very validator the server
+// uses (api/coach/core/changes.js), so every id resolves, the before/after values are real, and
+// applying it exercises exactly the same code path as a live instance: check, snapshot, apply,
+// log, undo. What is faked is the model, not the feature.
 //
 // Nothing here ships in a self-hosted bundle: every entry point is behind DEMO, which Vite
 // replaces at build time.
 
-import { EXIDX, EXDB } from './exercises.js'
-import { modeOf, workoutVolume, workoutAt } from './history.js'
-import { isWarmupRow } from './workout-model.js'
+import { EXIDX } from './exercises.js'
+import { workoutAt } from './history.js'
 import { best1RM } from './onerm.js'
-import { fmtNum } from './format.js'
-import { planHash } from './coach.js'
+import { todayISO } from './format.js'
+import { validateChangeSet } from '../../../api/coach/core/changes.js'
+import { DATA_CATEGORIES } from '../../../api/coach/core/categories.js'
 import { t } from './i18n.js'
 
-const DELAY = 2200      // long enough to see "the Coach is thinking…", short enough to forgive
+const DELAY = 1800      // long enough to see "thinking", short enough to forgive
 
-let pending = null
 let job = null
+let chat = []
+let rev = 0
 let timer = null
-let lastError = null    // the last job that ended without a proposal, in the server's shape
 
-const iso = d => d.toISOString().slice(0, 10)
+const id = () => Math.random().toString(36).slice(2, 10)
+const push = m => { chat = [...chat, m]; rev++ }
 
-/** The routine the canned review aims at: the first with two exercises, one to swap and one to cut a set from. */
-const reviewable = S => (S.routines || []).find(r => (r.ex || []).length >= 2)
-
-/** A change-set that reads like a real one, aimed at whatever the demo profile actually has. */
-function buildReview(S) {
-  const routine = reviewable(S)
-  if (!routine) return null
-  const reps = (routine.ex || []).filter(e => modeOf(e) === 'reps')
-  const first = reps[0] || routine.ex[0]
-  // Anything but `first`: the two changes below swap `first` away and re-set `second`, so the
-  // same entry in both aborts the whole change-set on apply (`missing target`). `reps[1]` was
-  // not enough — a routine whose only rep-mode exercise sits at index 1 landed on it twice.
-  const second = reps.find(e => e !== first) || routine.ex.find(e => e !== first)
-  const other = (S.routines || []).find(r => r.id !== routine.id)
-
-  // Something plausible that is *not* in this routine, from the same body part as the first
-  // exercise — a swap the reader can believe rather than a random pick out of 1,324.
-  const bp = EXIDX[first.id]?.bp
-  const swapTo = EXDB.find(e => e.bp === bp && e.eq === 'dumbbell' && !(routine.ex || []).some(x => x.id === e.id))
-    || EXDB.find(e => e.bp === bp && !(routine.ex || []).some(x => x.id === e.id))
-
-  const sessions = (S.workouts || []).slice(-9)
+/** What the canned assistant proposes for a message, checked like a real proposal; or nothing. */
+export function buildProposal(S, text) {
+  const wantsWeight = /weigh|weight|kg|lb|scale|mérleg|súly/i.test(text)
+  const wantsPlan = /plan|set|sets|volume|routine|squat|press|bench|edz/i.test(text)
   const changes = []
-  if (swapTo) changes.push({
-    id: 'd1', type: 'swap-exercise', target: { routineId: routine.id, exId: first.id },
-    before: EXIDX[first.id]?.n || first.id, after: { id: swapTo.id, name: swapTo.n },
-    why: t('Every top set on this one came in at RPE 9.5 or above for three sessions and the weight has not moved. Swapping the movement for four weeks usually breaks that stall faster than grinding the same one.')
-  })
-  if (second) changes.push({
-    id: 'd2', type: 'sets', target: { routineId: routine.id, exId: second.id },
-    before: second.sets ?? 3, after: Math.max(1, (second.sets ?? 3) - 1),
-    why: t('Sessions have been running about fifteen minutes over. This is the accessory with the least to lose from one set fewer.')
-  })
-  if (other) changes.push({
-    id: 'd3', type: 'week', target: { weekday: 6 }, before: null, after: other.id,
-    why: t('You have moved this session to Saturday three weeks running. Better the plan says so than that you keep overriding it.')
-  })
-
-  return {
-    id: 'demo-review', kind: 'review', createdAt: Date.now(), expiresAt: Date.now() + 864e5,
-    planHash: planHash(S), iteration: 1,
-    summary: t('Three things worth changing, and one worth knowing about. Everything else is working: the squat and the pulls are both progressing on schedule.'),
-    evidence: { from: sessions[0]?.d || iso(new Date(Date.now() - 28 * 864e5)), to: sessions.at(-1)?.d || iso(new Date()), sessions: sessions.length || 9 },
-    changes,
-    notes: [t('Body weight has been flat for four weeks while the goal is to gain. That’s a kitchen problem, not a training one. The plan isn’t what’s holding it back.')]
-  }
-}
-
-/** A small, honest starter plan for the demo's creation flow. */
-function buildPlan(S, intake) {
-  const pick = (bp, eq) => EXDB.find(e => e.bp === bp && (!eq || e.eq === eq)) || EXDB.find(e => e.bp === bp)
-  const days = intake?.preferredDays?.length ? intake.preferredDays.slice(0, 3) : [1, 3, 5]
-  const eq = (intake?.equipment || [])[0] || null
-  const mk = (id, name, sets, reps, why) => ({ id, sets, reps, mode: 'reps', why })
-  const routines = [
-    {
-      id: 'dr1', name: t('Full body A'), emoji: '💪', prog: 'linear',
-      why: t('The two big lower-body and pressing patterns first, while you are fresh.'),
-      ex: [
-        mk(pick('upper legs', eq)?.id, null, 3, 8, t('The main lower-body driver, where most of the strength comes from.')),
-        mk(pick('chest', eq)?.id, null, 3, 10, t('Horizontal pressing, the other half of the session.')),
-        mk(pick('back', eq)?.id, null, 3, 10, t('A pull for every press, so the shoulders stay balanced.'))
-      ].filter(e => e.id)
-    },
-    {
-      id: 'dr2', name: t('Full body B'), emoji: '🏋️', prog: 'linear',
-      why: t('The same patterns, different variations: enough overlap to progress, enough difference to stay fresh.'),
-      ex: [
-        mk(pick('upper legs', eq)?.id, null, 3, 10, t('Same pattern, higher reps than day A.')),
-        mk(pick('shoulders', eq)?.id, null, 3, 10, t('Vertical pressing.')),
-        mk(pick('upper arms', eq)?.id, null, 3, 12, t('Direct arm work, since you asked for it.'))
-      ].filter(e => e.id)
-    }
-  ]
-  const week = {}
-  days.forEach((d, i) => { week[d] = routines[i % routines.length].id })
-  return {
-    id: 'demo-plan', kind: 'create', createdAt: Date.now(), expiresAt: Date.now() + 864e5, iteration: 1,
-    planHash: planHash(S),
-    summary: t('A two-day rotation across three sessions a week, built around the equipment you listed. Compounds first, one pull for every press, and enough overlap between the days that nothing goes two weeks without being trained.'),
-    bundle: {
-      opengym_plan: 1, name: t('Coach plan'),
-      summary: t('A two-day rotation across three sessions a week, built around the equipment you listed. Compounds first, one pull for every press, and enough overlap between the days that nothing goes two weeks without being trained.'),
-      basedOn: (S.workouts || []).length ? t('Based on the training already in this demo profile.') : t('No training history yet, so starting conservatively.'),
-      week, routines, customEx: []
+  if (wantsWeight) {
+    changes.push({
+      type: 'bodyweight-set', target: { date: todayISO() }, after: lastWeight(S) || 80,
+      why: t('You asked me to log your weight. I used your latest weigh-in as the number: change it if the scale said something else.')
+    })
+  } else if (wantsPlan) {
+    const r = (S.routines || []).find(x => (x.ex || []).length)
+    const ex = r && r.ex.find(e => e.sets && (e.reps || e.sec))
+    if (ex) {
+      changes.push({
+        type: 'sets', target: { routineId: r.id, exId: ex.id }, after: Math.min(10, (ex.sets || 3) + 1),
+        why: t('This is the lift where you ask for the most volume, and your last sessions on it were clean. One more set is the smallest useful step up.')
+      })
     }
   }
+  if (!changes.length) return null
+  const v = validateChangeSet(S, { summary: wantsWeight ? t('Log a weigh-in for today.') : t('One more set on a lift that is going well.'), changes }, { today: todayISO() })
+  if (!v.ok) return null
+  return { id: 'demo-' + id(), summary: v.summary, createdAt: Date.now(), status: 'pending', changes: v.changes }
+}
+const lastWeight = S => {
+  const w = (S.bodyweight || []).filter(b => b && b.d && Number(b.w) > 0).sort((a, b) => (a.d < b.d ? -1 : 1)).at(-1)
+  return w ? Number(w.w) : null
 }
 
-/** One session, read back with its own numbers — no plan changes, just what a coach would say after. */
-function buildDebrief(S, workoutId) {
-  const all = (S.workouts || []).filter(w => w && w.d)
-  const w = all.find(x => x.id === workoutId) || all[all.length - 1]
-  if (!w) return null
-  // workoutVolume() reads `w.entries` and `e.sets` without a guard; every other line here
-  // tolerates both being absent. A workout carrying a date and nothing else therefore threw
-  // inside the timer below, where at the time nothing caught it — the job stayed 'running'
-  // for ever and every later request answered 409.
-  const entries = (w.entries || []).map(en => ({ ...en, sets: en.sets || [] }))
-  const done = entries.reduce((n, en) => n + en.sets.filter(s => s.done && !isWarmupRow(s)).length, 0)
-  const planned = entries.reduce((n, en) => n + en.sets.filter(s => !isWarmupRow(s)).length, 0)
-  const vol = Math.round(Number.isFinite(w.vol) ? w.vol : workoutVolume({ ...w, entries }))
-  const prs = (w.prs || []).length
-  const minutes = w.end && w.start ? Math.round((w.end - w.start) / 60000) : null
-  const complete = planned > 0 && done >= planned
-  const score = complete ? (prs ? 9 : 8) : 7
-  const highlights = [
-    complete ? t('Every planned set done: {0} of {1}.', done, planned) : t('{0} of {1} planned sets done.', done, planned),
-    t('{0} {1} moved in total.', fmtNum(vol), S.unit)
-  ]
-  if (prs) highlights.push(t('{0} new personal records.', prs))
-  const watch = minutes && minutes > 80 ? [t('{0} minutes is long. Rest periods may be creeping up.', minutes)] : [t('Top sets logged without an effort rating; add RIR so the next review can read how hard they were.')]
-  const nextTime = [complete ? t('Add the next load step on the main lift.') : t('Repeat the same loads and get every set.'), t('Keep the session under an hour and a quarter.')]
-  return {
-    id: 'demo-debrief', kind: 'debrief', createdAt: Date.now(), expiresAt: Date.now() + 864e5,
-    planHash: planHash(S), iteration: 1,
-    workout: { id: w.id, d: w.d, name: w.name || null, minutes, vol, sets: done, prs },
-    summary: complete
-      ? t('A clean session: everything on the sheet got done and the loads held. This is exactly what progress looks like from the inside: unremarkable, repeated.')
-      : t('Most of the work got done. One or two sets fell short, which is fine once. It only becomes a signal if the same sets miss next time.'),
-    score, highlights, watch, nextTime
-  }
+function reply(S, text) {
+  const proposal = buildProposal(S, text)
+  const named = proposal && proposal.changes[0].type === 'sets' ? EXIDX[proposal.changes[0].target.exId]?.n : null
+  if (proposal && proposal.changes[0].type === 'bodyweight-set') return { text: t('Sure. I would log today’s weigh-in. Have a look at the card and tap Apply if it is right; you can undo it afterwards.'), proposal }
+  if (proposal) return { text: t('Here is what I would change{0}. The reason is on the card, and nothing happens until you tap Apply.', named ? ` (${named})` : ''), proposal }
+  return { text: t('This is a demo: I answer from a script. Try “log my weight” or “add a set to my plan” and I will propose a real change you can apply and undo. On your own server I answer anything about your training, from your own data.') }
 }
 
 /** What "the room" would say on a busy instance — five people, plausible medians, your real bests. */
@@ -168,46 +84,42 @@ export function demoCohort(S) {
 
 /* ---------------- the API surface the demo stands in for ---------------- */
 
-export const demoStatus = () => ({ job, pending, cap: { used: 0, limit: 0 }, lastError })
+export const demoStatus = () => ({ job, cap: { used: 0, limit: 0 }, last: null, chatRev: rev, assistant: { supported: true, provider: 'demo' } })
+export const demoChat = () => ({ chat, chatRev: rev })
 
-function start(kind, make) {
-  if (job) throw Object.assign(new Error(t('The Coach is already thinking about your training.')), { status: 409 })
-  job = { id: 'demo-' + kind, kind, state: 'running', startedAt: Date.now() }
-  lastError = null
+export function demoSend(getS, text) {
+  if (job) throw Object.assign(new Error(t('The Coach is already thinking about your training.')), { status: 409, code: 'busy' })
+  const clean = String(text || '').trim().slice(0, 1000)
+  if (!clean) throw Object.assign(new Error(t('Write a message first.')), { status: 400, code: 'empty' })
+  const message = { id: id(), role: 'user', kind: 'text', text: clean, at: Date.now() }
+  push(message)
+  job = { id: 'demo-' + id(), state: 'running', startedAt: Date.now() }
   clearTimeout(timer)
-  // A builder that throws still has to end the job: left uncaught, one throw kept `job` at
-  // 'running' for ever and every later request answered 409 until the page was reloaded. The
-  // failure is recorded the way the server and the phone record theirs, so the chat's
-  // job-ended effect writes the same error line it would for them. `nostate` because the only
-  // thing a builder can trip over is the shape of the profile's own data.
+  // A builder that throws still has to end the job: left uncaught, one throw would keep `job` at
+  // 'running' for ever and every later message would answer 409 until the page was reloaded.
   timer = setTimeout(() => {
-    try { pending = make() }
-    catch (e) { lastError = { errorClass: 'nostate', detail: String(e && e.message || e) } }
+    try { push({ id: id(), role: 'assistant', kind: 'text', at: Date.now(), ...reply(getS(), clean) }) }
+    catch { push({ id: id(), role: 'assistant', kind: 'error', text: '', errorClass: 'nostate', at: Date.now() }) }
     finally { job = null }
   }, DELAY)
-  return { job }
+  return { job: { id: job.id }, message }
 }
-export const demoReview = S => {
-  // Refused before the job starts, the way demoDebrief refuses with no workout: without a
-  // two-exercise routine buildReview has nothing to aim at, and a job that runs the whole wait
-  // and ends with neither a proposal nor an error reads as the Coach ignoring you.
-  if (!reviewable(S)) throw Object.assign(new Error(t('There’s no routine to review yet. Build one with at least two exercises first.')), { status: 409, code: 'noroutine' })
-  return start('review', () => buildReview(S))
+
+const NEXT = { pending: ['applied', 'dismissed'], applied: ['undone'] }
+export function demoResolve(pid, status) {
+  const i = chat.findIndex(m => m.proposal && m.proposal.id === pid)
+  if (i < 0) return { ok: false, code: 'unknown' }
+  const p = chat[i].proposal
+  if (!(NEXT[p.status] || []).includes(status)) return { ok: false, code: 'state', status: p.status }
+  chat = chat.map((m, k) => (k === i ? { ...m, proposal: { ...p, status, decidedAt: Date.now() } } : m))
+  rev++
+  return { ok: true, status }
 }
-export const demoPlan = (S, intake) => start('create', () => buildPlan(S, intake))
-// A refine re-reads the saved answers, as the server's payload does when a refine carries no
-// intake of its own (`opts.intake || coach.profile`). Built from nothing, every revised plan
-// went back to Mon/Wed/Fri whatever days were chosen at intake.
-export const demoRefine = S => start('create', () => {
-  const p = buildPlan(S, S.coach?.profile || null)
-  return { ...p, iteration: (pending?.iteration || 1) + 1, summary: t('Revised as you asked. Everything you did not question is exactly as it was.') + ' ' + p.summary }
-})
-export const demoDebrief = (S, workoutId) => {
-  if (!(S.workouts || []).some(w => w && w.d)) throw Object.assign(new Error(t('There’s no workout to look at yet. Log one first.')), { status: 409, code: 'noworkout' })
-  return start('debrief', () => buildDebrief(S, workoutId))
-}
-export const demoResolve = () => { pending = null; return { ok: true } }
+export const demoForget = () => { clearTimeout(timer); job = null; chat = []; rev++; return { ok: true } }
 export const demoDisclosure = () => ({
   provider: 'demo', providerLabel: t('the configured AI provider'),
-  categories: ['plan', 'training', 'bodyweight', 'profile', 'prefs'], version: 1
+  categories: DATA_CATEGORIES, flow: 'tools', version: 2
 })
+
+// Test seam.
+export function _resetDemo() { clearTimeout(timer); job = null; chat = []; rev = 0 }

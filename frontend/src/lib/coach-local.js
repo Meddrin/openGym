@@ -1,22 +1,28 @@
-// The Coach, on a phone that brings its own API key.
+// The assistant, on a phone that brings its own Anthropic key.
 //
-// No server. The pipeline the server runs — payload allowlist, prompt, provider call, parser,
-// validator, one repair round — is imported from api/coach/core and run here, in-process, so
-// the phone gets exactly the code the server has and not a second opinion of it. The apply
-// engine, staleness, snapshot/revert and the log are the ones every build already uses.
+// No server. The loop the server runs for the Anthropic API — the same nine tools, the same
+// system prompt, the same tool loop over the Messages API — is imported from api/coach and run
+// here, in-process, so the phone gets exactly the code the server has and not a second opinion of
+// it. The tools read the profile straight out of the store (there is no other profile on a phone),
+// and a proposal is applied by the same engine every build uses (lib/coach-changes.js).
 //
-// This module is the one static importer of the core, which makes `import('./coach-local.js')`
-// the whole lazy chunk: the exercise catalogue, the prompts and the validator arrive together
-// and only after the user chose this mode. coach-api.js dispatches here the same way it
-// dispatches to the demo provider, so the screens never learn that there is no server.
+// This module is the one static importer of that code, which makes `import('./coach-local.js')`
+// the whole lazy chunk: the exercise catalogue, the tools and the loop arrive together and only
+// after the user chose this mode. coach-api.js dispatches here the way it dispatches to the demo,
+// so the screens never learn that there is no server.
+//
+// Only the Anthropic API can run the assistant from here: it needs a tool loop, and the other
+// providers' adapters do not have one. The status says so (`assistant.supported`), and the screen
+// tells the person which provider it needs instead of offering a chat that cannot answer.
 //
 // What is different from the server, and on purpose:
 //   - the user pays. There is no cfg.caps to lean on, so a local daily cap is not optional.
-//   - the pseudonym is drawn at random once and kept, rather than derived from a secret.
-//   - a proposal waits in the device file, not in S, so it survives an app kill without
-//     riding into a backup or a sync.
-import * as payloadLib from '../../../api/coach/core/payload.js'
-import { runPipeline } from '../../../api/coach/core/pipeline.js'
+//   - the conversation lives in the device file, not in S: it is a device fact, it must not ride
+//     into a backup or a sync, and a proposal waiting there survives an app kill.
+import { createToolset, todayFor } from '../../../api/coach/assistant/tools.js'
+import { buildPrompt } from '../../../api/coach/assistant/transcript.js'
+import SYSTEM_PROMPT from '../../../api/coach/prompts/assistant.md?raw'
+import { DATA_CATEGORIES } from '../../../api/coach/core/categories.js'
 import { HTTP_PROVIDERS, baseUrlFor } from '../../../api/coach/core/providers.js'
 import anthropic from '../../../api/coach/core/adapters/anthropic.js'
 import openai from '../../../api/coach/core/adapters/openai.js'
@@ -25,47 +31,26 @@ import compatible from '../../../api/coach/core/adapters/compatible.js'
 import { nativeFetch } from './capacitor-fetch.js'
 import { getApiKey } from './coach-secrets.js'
 import { loadCoachDevice, saveCoachDevice } from './coach-device.js'
-import { planHash } from './coach.js'
 import { todayISO } from './format.js'
 import { t, getLang } from './i18n.js'
 
 export const ADAPTERS = { anthropic, openai, gemini, compatible }
 export const LOCAL_DAILY_CAP = 10
-// Five minutes is right for a cloud API and wrong for a model on somebody's laptop; the
-// OpenAI-compatible endpoint is the one that may be local, so it gets the long budget.
 export const TIMEOUT_MS = 5 * 60000
-export const LOCAL_ENDPOINT_TIMEOUT_MS = 25 * 60000
-export const timeoutFor = provider => (provider === 'compatible' ? LOCAL_ENDPOINT_TIMEOUT_MS : TIMEOUT_MS)
-const PENDING_DAYS = 14
-const HANDLE_LENGTH = 16
+export const CHAT_MAX = 40
+export const FULL_PROPOSALS = 6
+const MESSAGE_MAX = 1000
+const TEXT_MAX = 8000
 
 let job = null
-let lastError = null
 let last = null   // how the most recent job ended — the same shape the server's status() reports
-// Reported to the screens through the same status shape the server answers with; a toast is
-// also raised because on the server a failed job lands in the admin card, and here there is
-// no admin card — the user is the operator.
-let notify = null
-export function setNotifier(fn) { notify = fn }
 
 /* ---------- what this phone is configured with ---------- */
 
 const cfgOf = d => ({ provider: d.provider, providerOptions: d.baseUrl ? { [d.provider]: { baseUrl: d.baseUrl } } : {} })
 const envOf = (d, key) => (key ? { [HTTP_PROVIDERS[d.provider].apiKeyEnv]: key } : {})
-
-function mintHandle() {
-  const bytes = new Uint8Array(12)
-  ;(globalThis.crypto || {}).getRandomValues ? crypto.getRandomValues(bytes) : bytes.forEach((_, i) => { bytes[i] = Math.floor(Math.random() * 256) })
-  let bin = ''; bytes.forEach(b => { bin += String.fromCharCode(b) })
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '').slice(0, HANDLE_LENGTH)
-}
-async function handle() {
-  const d = await loadCoachDevice()
-  if (d.handle && d.handle.length === HANDLE_LENGTH) return d.handle
-  const h = mintHandle()
-  await saveCoachDevice({ handle: h })
-  return h
-}
+const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+const supported = d => d.provider === 'anthropic' && !!ADAPTERS[d.provider]?.tools
 
 /* ---------- the cap ---------- */
 
@@ -80,24 +65,54 @@ async function bumpDaily() {
   await saveCoachDevice({ daily: { d: todayISO(), n: used + 1 } })
 }
 
+/* ---------- the thread ---------- */
+
+/** Bounded like the server's: the newest messages, and only the newest proposals keep their changes. */
+export function boundChat(chat) {
+  const out = chat.slice(-CHAT_MAX)
+  let whole = 0
+  for (let i = out.length - 1; i >= 0; i--) {
+    const p = out[i].proposal
+    if (p && Array.isArray(p.changes) && ++whole > FULL_PROPOSALS) {
+      const { changes, ...rest } = p
+      out[i] = { ...out[i], proposal: { ...rest, count: changes.length, kinds: [...new Set(changes.map(c => c.type))].slice(0, 8) } }
+    }
+  }
+  return out
+}
+async function append(msg) {
+  const d = await loadCoachDevice()
+  await saveCoachDevice({ chat: boundChat([...(d.chat || []), msg]), rev: (d.rev || 0) + 1 })
+}
+
 /* ---------- the API surface coach-api.js dispatches to ---------- */
 
 export async function localStatus() {
   const d = await loadCoachDevice()
-  if (d.pending && d.pending.expiresAt && d.pending.expiresAt < Date.now()) await saveCoachDevice({ pending: null })
-  return { job, pending: (await loadCoachDevice()).pending || null, cap: await capState(), lastError, last }
+  return {
+    job, cap: await capState(), last, chatRev: d.rev || 0,
+    assistant: { supported: supported(d), provider: d.provider }
+  }
+}
+export async function localChat() {
+  const d = await loadCoachDevice()
+  return { chat: d.chat || [], chatRev: d.rev || 0 }
 }
 
-export const localReview = (S, note) => start(S, 'review', { note: note ? String(note).slice(0, 1000) : null })
-export const localPlan = (S, intake) => start(S, 'create', { intake: intake || null })
-export const localRefine = async (S, text) => {
+const STATUS_NEXT = { pending: ['applied', 'dismissed'], applied: ['undone'] }
+/** What the person did with a proposal, recorded forward only, as the server records it. */
+export async function localResolve(id, status) {
   const d = await loadCoachDevice()
-  const pendingCreate = d.pending && d.pending.kind === 'create' ? d.pending : null
-  return start(S, 'create', { refine: String(text || '').slice(0, 1000), previous: pendingCreate?.bundle || null, iteration: (pendingCreate?.iteration || 1) + 1 })
+  const chat = [...(d.chat || [])]
+  const i = chat.findIndex(m => m.proposal && m.proposal.id === id)
+  if (i < 0) return { ok: false, code: 'unknown' }
+  const p = chat[i].proposal
+  if (!(STATUS_NEXT[p.status] || []).includes(status)) return { ok: false, code: 'state', status: p.status }
+  chat[i] = { ...chat[i], proposal: { ...p, status, decidedAt: Date.now() } }
+  await saveCoachDevice({ chat, rev: (d.rev || 0) + 1 })
+  return { ok: true, status }
 }
-export const localDebrief = (S, workoutId) => start(S, 'debrief', { workoutId: workoutId || null })
-export async function localResolve() { await saveCoachDevice({ pending: null }); return { ok: true } }
-export async function localForget() { job = null; lastError = null; await saveCoachDevice({ pending: null, daily: null }); return { ok: true } }
+export async function localForget() { job = null; last = null; await saveCoachDevice({ chat: [], rev: 0, daily: null }); return { ok: true } }
 
 export async function localDisclosure() {
   const d = await loadCoachDevice()
@@ -105,7 +120,7 @@ export async function localDisclosure() {
   const base = d.provider ? baseUrlFor(d.provider, cfgOf(d)) : ''
   return {
     provider: d.provider, providerLabel: meta.label || t('the configured AI provider'),
-    categories: payloadLib.DATA_CATEGORIES, version: 1,
+    categories: DATA_CATEGORIES, flow: 'tools', version: 2,
     // The honest difference from the self-hosted flow: it is the user's own account.
     payer: 'you', host: hostOf(base)
   }
@@ -122,69 +137,65 @@ const hostOf = url => { try { return new URL(url).host } catch { return url || '
 
 /* ---------- running a job ---------- */
 
-async function start(S, kind, opts) {
-  if (job) throw Object.assign(new Error(t('The Coach is already thinking about your training.')), { status: 409, code: 'busy' })
-  if (!S?.coach?.consent?.agreedAt) throw Object.assign(new Error(t('The Coach needs your go-ahead first.')), { status: 403, code: 'consent' })
+const refuse = (code, message, status) => Object.assign(new Error(message), { status, code })
+
+/**
+ * One message, one job. `getS` reads the live state: the tools are bound to it, so they see
+ * what the person sees, including an edit made while the assistant was thinking.
+ */
+export async function localSend(getS, text) {
+  const S = getS()
+  if (job) throw refuse('busy', t('The Coach is already thinking about your training.'), 409)
+  if (!S?.coach?.consent?.agreedAt) throw refuse('consent', t('The Coach needs your go-ahead first.'), 403)
   const d = await loadCoachDevice()
   const adapter = ADAPTERS[d.provider]
-  if (d.mode !== 'byok' || !adapter) throw Object.assign(new Error(t('The Coach isn’t set up on this phone.')), { status: 503, code: 'off' })
+  if (d.mode !== 'byok' || !adapter) throw refuse('off', t('The Coach isn’t set up on this phone.'), 503)
+  if (!supported(d)) throw refuse('tools', t('The assistant needs the Anthropic API (or Claude on a server). Check Settings → AI Coach.'), 409)
+  const clean = String(text || '').trim().slice(0, MESSAGE_MAX)
+  if (!clean) throw refuse('empty', t('Write a message first.'), 400)
   const cap = await capState()
-  if (cap.used >= cap.limit) throw Object.assign(new Error(t('The Coach is taking a breather. You’ve used today’s {0} runs on this phone.', cap.limit)), { status: 429, code: 'cap' })
+  if (cap.used >= cap.limit) throw refuse('cap', t('The Coach is taking a breather. You’ve used today’s {0} runs on this phone.', cap.limit), 429)
 
   await bumpDaily()
-  job = { id: 'local-' + Date.now().toString(36), kind, state: 'running', startedAt: Date.now() }
-  lastError = null
+  const before = d.chat || []
+  const message = { id: newId(), role: 'user', kind: 'text', text: clean, at: Date.now() }
+  await append(message)
+  job = { id: 'local-' + Date.now().toString(36), state: 'running', startedAt: Date.now() }
   // Not awaited: the screens poll, exactly as they do against a server.
-  run(S, kind, opts, d, adapter).catch(e => { lastError = { errorClass: 'internal', detail: String(e && e.message || e) } }).finally(() => { job = null })
-  return { job }
+  const mine = job
+  run(getS, clean, before, d, adapter, mine).catch(e => finish(mine, 'failed', 'internal', String(e && e.message || e))).finally(() => { job = null })
+  return { job: { id: mine.id }, message }
 }
 
-async function run(S, kind, opts, d, adapter) {
+const finish = async (j, outcome, errorClass, detail, message) => {
+  last = { id: j.id, outcome, errorClass: errorClass || null, at: Date.now() }
+  await append(message || { id: newId(), role: 'assistant', kind: 'error', text: '', errorClass, ...(detail ? { detail: String(detail).slice(0, 300) } : {}), at: Date.now() })
+}
+
+async function run(getS, text, before, d, adapter, j) {
   const key = await getApiKey()
-  const payload = payloadLib.build(S, {
-    handle: await handle(), kind, intake: opts.intake, note: opts.note, refine: opts.refine, previous: opts.previous, workoutId: opts.workoutId,
-    lang: getLang()   // what the app shows, which a profile that never picked a language does not store (#303)
+  const S = getS()
+  const toolset = createToolset({ uid: 'device', readState: () => getS() })
+  const r = await adapter.invoke({
+    cfg: cfgOf(d), env: envOf(d, key), fetch: nativeFetch, tools: toolset, system: SYSTEM_PROMPT,
+    model: d.model || HTTP_PROVIDERS[d.provider].defaultModel, timeoutMs: TIMEOUT_MS,
+    prompt: buildPrompt({ history: before, message: text, today: todayFor(S), lang: getLang(), unit: S.unit === 'lb' ? 'lb' : 'kg' })
   })
-  const attempt = await runPipeline({
-    adapter, cfg: cfgOf(d), kind, payload,
-    model: d.model || HTTP_PROVIDERS[d.provider].defaultModel, timeoutMs: timeoutFor(d.provider),
-    invokeOpts: { env: envOf(d, key), fetch: nativeFetch }
+  if (r.timedOut) return finish(j, 'failed', 'timeout')
+  if (r.spawnError) return finish(j, 'failed', 'missing', r.stderr)
+  if (r.code !== 0) {
+    const err = (r.stderr || r.text || '').toLowerCase()
+    return finish(j, 'failed', /auth|unauthor|api key|credential|token|401|403/.test(err) ? 'auth' : 'provider', r.stderr || r.text)
+  }
+  const proposal = toolset.proposal()
+  let reply = String(r.text || '').trim().slice(0, TEXT_MAX)
+  if (!reply && proposal) reply = proposal.summary || ''
+  if (!reply) return finish(j, 'failed', 'unusable', 'the assistant answered with nothing')
+  return finish(j, 'ready', null, null, {
+    id: newId(), role: 'assistant', kind: 'text', text: reply, at: Date.now(),
+    ...(proposal ? { proposal: { id: proposal.id, summary: proposal.summary || '', createdAt: proposal.createdAt, status: 'pending', changes: proposal.changes } } : {})
   })
-  if (!attempt.ok) {
-    // There is no admin card on a phone, so the reason has to reach the person holding it:
-    // the provider's own words for a refusal, the validator's for an answer that did not fit.
-    const detail = attempt.detail || (Array.isArray(attempt.errors) && attempt.errors.length
-      ? attempt.errors.slice(0, 3).map(String).join(' · ').slice(0, 300)
-      : null)
-    lastError = { errorClass: attempt.errorClass, detail }
-    last = { id: job.id, kind, outcome: 'failed', errorClass: attempt.errorClass, at: Date.now() }
-    if (notify) notify({ kind: 'failed', errorClass: attempt.errorClass, detail })
-    return
-  }
-  if (attempt.nochange) {
-    last = { id: job.id, kind, outcome: 'nochange', errorClass: null, at: Date.now(), reading: attempt.reading }
-    if (notify) notify({ kind: 'nochange', reading: attempt.reading })
-    return
-  }
-  const pending = {
-    id: job.id, kind, createdAt: Date.now(), expiresAt: Date.now() + PENDING_DAYS * 86400000,
-    planHash: planHash(S), iteration: opts.iteration || 1,
-    ...(kind === 'debrief' ? { workout: workoutMetaOf(S, opts.workoutId) } : {}),
-    ...attempt.result
-  }
-  await saveCoachDevice({ pending })
-  last = { id: job.id, kind, outcome: 'ready', errorClass: null, at: Date.now() }
-  if (notify) notify({ kind: 'ready', pending })
-}
-
-// The session a debrief is about, in the shape the card reads. The core builds it for the
-// server; the fallback covers a core that predates it.
-function workoutMetaOf(S, workoutId) {
-  if (typeof payloadLib.workoutMeta === 'function') return payloadLib.workoutMeta(S, workoutId)
-  const all = (S.workouts || []).filter(w => w && w.d)
-  const w = all.find(x => x.id === workoutId) || all[all.length - 1]
-  return w ? { id: w.id, d: w.d, name: w.name || null } : null
 }
 
 // Test seam.
-export function _resetLocal() { job = null; lastError = null; last = null }
+export function _resetLocal() { job = null; last = null }

@@ -42,8 +42,8 @@ everything as one file at any time under **Settings → Data & backup**.
 
 Your instance has no telemetry and phones home to nobody. The exercise pictures and animations ship
 inside the web image, so not even those are downloaded. The AI coach, if an admin turns it on, sends
-the training data it needs to the provider you configured; [AI_COACH.md](AI_COACH.md) lists exactly
-what. Push notifications go through your browser's push service, as all web push does.
+the questions you type and the pieces of your own data it looks up to answer them to the provider
+you configured; [AI_COACH.md](AI_COACH.md) lists exactly what. Push notifications go through your browser's push service, as all web push does.
 
 ### Was openGym written with AI?
 
@@ -55,8 +55,8 @@ the [README](../README.md#how-opengym-is-built).
 ### Does the app itself use AI?
 
 Only if you turn it on. The default install calls no AI service. Two optional pieces exist: the
-[AI coach](AI_COACH.md) (off until an admin enables it, runs with your own provider key, every
-change needs your approval) and the [MCP server](../mcp/README.md), which lets an AI client on your
+[AI coach](AI_COACH.md) (off until an admin enables it, runs with your own provider account, every
+change needs your approval and can be undone) and the [MCP server](../mcp/README.md), which lets an AI client on your
 computer read your history. Neither is needed for anything else in the app.
 
 ### My passkey sign-in doesn't work.

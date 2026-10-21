@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+**The Coach is an assistant now**
+
+- **A chat you can ask anything.** Training, technique, food, or your own numbers: it looks things
+  up in your data with tools bound to your profile, answers in your language, and keeps the
+  conversation on the server so a reply that arrives while the app is closed is there when you open it.
+- **It proposes edits to everything you can edit yourself**: routines and the week, a day's plan,
+  logged workouts (add, edit, delete), body weight, exercise notes, your own exercises, a set of
+  settings and your coach profile. You apply a proposal with one tap, each change shown with a
+  before and an after and the reason, and you undo it with one tap. A proposal applies whole or not
+  at all, and is checked again on your device against your data as it is now.
+- **It needs Claude or the Anthropic API**, because it is a tool loop. On another provider the Coach
+  screen says which one it needs. A phone can run it with its own Anthropic key.
+- Gone: the fixed plan, review and debrief jobs, the scheduled review, the mandatory intake (your
+  answers stay as an optional profile you can edit from the Coach menu) and the JSON repair round.
+  The consent screen was rewritten for the new data flow, so everyone is asked again.
+
 ## v1.4.1 (2026-10-10)
 
 Bug fixes for v1.4.0, mostly the things you told us about on Discord and GitHub.

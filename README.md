@@ -115,9 +115,10 @@ if you want to try it before installing anything.
 
 **Optional extras, off by default**
 
-- An [AI coach](docs/AI_COACH.md) that drafts a week of routines and later suggests changes based on
-  what you logged. You approve every change. It runs on your server with your own provider key
-  (Anthropic, OpenAI, Gemini or any OpenAI-compatible endpoint, Ollama included).
+- An [AI coach](docs/AI_COACH.md): a chat assistant that answers questions about training, looks
+  things up in your own data, and proposes changes to your plan, workouts, body weight and settings.
+  You apply each proposal with one tap and can undo it with one tap. It runs on your server with
+  your own Claude or Anthropic API account.
 - An [MCP server](mcp/README.md) so an assistant like Claude Desktop can answer questions about your
   training history. Read-only and local; not part of the Docker build.
 

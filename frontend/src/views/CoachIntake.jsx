@@ -1,22 +1,18 @@
-// The questionnaire — the first thing the Coach asks, the moment somebody first opens it.
+// Edit the coach profile: the answers the Coach keeps in mind when it answers you.
 //
-// One question per screen, big targets, as little copy as the question allows. Only goal and
-// experience are required; everything after them makes the plan better without gating it,
-// and someone who wants to just get training can skip through. The consent disclosure is the
-// first screen of this flow rather than a separate card, because "what leaves the server" is
-// the first thing to know, not a setting to find later.
-//
-// `?edit=1` reuses every screen as the profile editor: consent is skipped, answers are
-// prefilled, and the last button saves instead of building.
-import { useEffect, useState } from 'react'
+// One question per screen, big targets, as little copy as the question allows. Every answer is
+// optional now: this used to be the gate in front of the Coach, and is context the assistant can
+// read (and propose edits to) instead. Nothing is built from it, so the last button just saves.
+// Reached from the Coach menu as `?edit=1`; without it there is nothing to ask and the route
+// goes back to the chat.
+import { useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useStore } from '../store/useStore.js'
 import { useUI } from '../store/useUI.js'
 import { t } from '../lib/i18n.js'
 import { DAYN } from '../lib/format.js'
 import { EXDB } from '../lib/exercises.js'
-import { emptyCoach, coachAvailable, hasConsent, CONSENT_VERSION, CATEGORY_TEXT, appendChat } from '../lib/coach.js'
-import { requestPlan, disclosure, JOB_ERRORS } from '../lib/coach-api.js'
+import { emptyCoach, coachAvailable, hasConsent } from '../lib/coach.js'
 import { DEMO } from '../lib/demo.js'
 import { MOBILE } from '../lib/mobile.js'
 import { activeProfile } from '../lib/equipment.js'
@@ -63,14 +59,8 @@ export default function CoachIntake() {
   const coachMode = useStore(s => s.coachLocal?.mode)
   const update = useStore(s => s.update)
   const toast = useUI(s => s.toast)
-  const [needConsent] = useState(() => !editing && !hasConsent(S))
-  // An athlete who already answered the intake and only lacks the CURRENT consent (the wording
-  // changed and CONSENT_VERSION moved) reads the new terms and goes back to the Coach. Without
-  // this the redirect from the chat replayed all seven questions and ended in a new plan request.
-  const [reconsentOnly] = useState(() => !editing && !hasConsent(S) && !!S.coach?.profile)
-  const STEPS = reconsentOnly ? ['consent'] : [...(needConsent ? ['consent'] : []), 'goal', 'experience', 'days', 'length', 'equipment', 'limits', 'extras']
+  const STEPS = ['goal', 'experience', 'days', 'length', 'equipment', 'limits', 'extras']
   const [step, setStep] = useState(0)
-  const [busy, setBusy] = useState(false)
   const [p, setP] = useState(() => ({
     goal: null, experience: null, daysPerWeek: 3, preferredDays: [1, 3, 5],
     // A home gym already set up under Settings → Equipment is the best first guess here.
@@ -80,43 +70,24 @@ export default function CoachIntake() {
   const set = patch => setP(v => ({ ...v, ...patch }))
 
   if (!coachAvailable(config, user, { demo: DEMO, mobile: MOBILE, coachMode })) { nav('/home', { replace: true }); return null }
+  // Nothing to edit before the first consent, and nothing to ask without ?edit=1.
+  if (!editing || !hasConsent(S)) { nav('/coach', { replace: true }); return null }
 
   const key = STEPS[step]
   const last = step === STEPS.length - 1
-  const canNext = key === 'goal' ? !!p.goal : key === 'experience' ? !!p.experience : key === 'length' ? p.sessionMin >= 10 : true
-  const optional = ['equipment', 'limits', 'extras'].includes(key)
+  const canNext = key === 'length' ? p.sessionMin >= 10 : true
+  const optional = true
 
   const next = () => (last ? finish() : setStep(step + 1))
-  const back = () => (step ? setStep(step - 1) : nav(editing ? '/coach' : '/plan'))
+  const back = () => (step ? setStep(step - 1) : nav('/coach'))
 
-  const agree = () => {
-    update(s => { s.coach = { ...(s.coach || emptyCoach()), consent: { agreedAt: new Date().toISOString(), version: CONSENT_VERSION } } })
-    if (reconsentOnly) nav('/coach', { replace: true })
-    else setStep(step + 1)
-  }
-
-  const finish = async () => {
+  const finish = () => {
     // `??`, not `||`: only a missing answer takes the default. Nought is an answer, and the clamp
     // turns it into one day like every other count below the floor.
     const profile = { ...p, daysPerWeek: Math.min(7, Math.max(1, p.daysPerWeek ?? 3)) }
-    update(s => {
-      const c = (s.coach = s.coach || emptyCoach())
-      c.profile = profile
-      // The conversation opens with the answers — rendered from the profile, so an edit later
-      // is reflected rather than duplicated. One intake line whoever is writing it: a first-timer
-      // whose plan request failed presses the button again, and must not open the thread with
-      // the questionnaire twice.
-      if (!(c.chat || []).some(m => m.kind === 'intake')) appendChat(s, { role: 'user', kind: 'intake' })
-    })
-    if (editing) { toast(t('Saved')); nav('/coach'); return }
-    setBusy(true)
-    try {
-      await requestPlan(profile)
-      nav('/coach', { replace: true })
-    } catch (e) {
-      // The server's refusal is English with its class beside it; the class picks the line.
-      toast(JOB_ERRORS[e.data?.code] || e.message || t('Could not ask the Coach')); setBusy(false)
-    }
+    update(s => { (s.coach = s.coach || emptyCoach()).profile = profile })
+    toast(t('Saved'))
+    nav('/coach')
   }
 
   const toggleDay = d => set({
@@ -126,25 +97,23 @@ export default function CoachIntake() {
     equipment: p.equipment.includes(e) ? p.equipment.filter(x => x !== e) : [...p.equipment, e]
   })
 
-  const dots = STEPS.filter(s => s !== 'consent')
+  const dots = STEPS
   const dotIndex = dots.indexOf(key)
 
   return <div className="narrow ob">
     <div className="ob-top">
       <button className="iconbtn" onClick={back} aria-label={t('Back')}><Icon name="chevronLeft" /></button>
-      {key !== 'consent' && <div className="ob-dots">
+      <div className="ob-dots">
         {dots.map((s, i) => <span key={s} className={'ob-dot' + (i === dotIndex ? ' on' : i < dotIndex ? ' done' : '')} />)}
-      </div>}
+      </div>
       {optional && !last ? <button className="ob-skip" onClick={next}>{t('Skip')}</button> : <span style={{ width: 36 }} />}
     </div>
 
     <div className="ob-body">
-      {key === 'consent' && <Consent onAgree={agree} onDecline={() => nav('/plan')} />}
-
       {key === 'goal' && <>
         <div className="ob-eyebrow">{t('Your goal')}</div>
         <h1 className="ob-h">{t('What are you training for?')}</h1>
-        <p className="ob-p">{t('The Coach builds the whole plan around this.')}</p>
+        <p className="ob-p">{t('The Coach keeps this in mind when it answers.')}</p>
         <div className="ob-choices">
           {GOALS.map(([v, text, icon]) => { const [title, sub] = text(); return <Choice key={v} on={p.goal === v} icon={icon} title={title} sub={sub} onClick={() => set({ goal: v })} /> })}
         </div>
@@ -153,7 +122,7 @@ export default function CoachIntake() {
       {key === 'experience' && <>
         <div className="ob-eyebrow">{t('Experience')}</div>
         <h1 className="ob-h">{t('Where are you starting from?')}</h1>
-        <p className="ob-p">{t('Sets the pace of progression, and how much the Coach assumes you know.')}</p>
+        <p className="ob-p">{t('Sets how much the Coach assumes you know.')}</p>
         <div className="ob-choices">
           {EXPERIENCE.map(([v, text, icon]) => { const [title, sub] = text(); return <Choice key={v} on={p.experience === v} icon={icon} title={title} sub={sub} onClick={() => set({ experience: v })} /> })}
         </div>
@@ -175,7 +144,7 @@ export default function CoachIntake() {
       {key === 'length' && <>
         <div className="ob-eyebrow">{t('Session length')}</div>
         <h1 className="ob-h">{t('How long is a session?')}</h1>
-        <p className="ob-p">{t('The Coach fits the volume to the time you actually have, including rest between sets.')}</p>
+        <p className="ob-p">{t('The Coach fits its advice to the time you actually have, including rest between sets.')}</p>
         {/* A duration, not a clock time — so two wheels (hours, minutes in fives), never the
             native time input, which insists on AM/PM. */}
         <div className="ob-time" role="group" aria-label={t('How long is a session?')}>
@@ -198,7 +167,7 @@ export default function CoachIntake() {
       {key === 'equipment' && <>
         <div className="ob-eyebrow">{t('Equipment')}</div>
         <h1 className="ob-h">{t('What can you train with?')}</h1>
-        <p className="ob-p">{t('Pick everything you have access to. Leave it empty and the Coach will use the whole library.')}</p>
+        <p className="ob-p">{t('Pick everything you have access to. Leave it empty and the Coach will not assume any.')}</p>
         <div className="ob-chips">
           {EQUIPMENT.map(e => <button key={e} className={'chip' + (p.equipment.includes(e) ? ' on' : '')} onClick={() => toggleEq(e)}>{t(e)}</button>)}
         </div>
@@ -228,12 +197,11 @@ export default function CoachIntake() {
       </>}
     </div>
 
-    {key !== 'consent' && <div className="ob-foot">
-      <Button variant="primary" style={{ flex: 1 }} disabled={!canNext || busy} icon={last ? 'sparkles' : undefined} onClick={next}>
-        {last ? (editing ? t('Save') : t('Build my plan')) : t('Continue')}
+    <div className="ob-foot">
+      <Button variant="primary" style={{ flex: 1 }} disabled={!canNext} icon={last ? 'check' : undefined} onClick={next}>
+        {last ? t('Save') : t('Continue')}
       </Button>
-    </div>}
-    {(key === 'goal' || key === 'experience') && !canNext && <div className="ob-hint">{t('Pick one to continue.')}</div>}
+    </div>
   </div>
 }
 
@@ -243,36 +211,4 @@ function Choice({ on, icon, title, sub, onClick }) {
     <span className="ob-choice-t">{title}{sub && <span className="ob-choice-s">{sub}</span>}</span>
     <Icon name="check" className="ob-k" />
   </button>
-}
-
-/* The disclosure: what leaves, where to, who pays. Rendered from the same category list the
-   payload is built from, so the promise on screen cannot drift from what actually goes. */
-function Consent({ onAgree, onDecline }) {
-  const config = useStore(s => s.config)
-  const [info, setInfo] = useState(null)
-  useEffect(() => { disclosure().then(setInfo).catch(() => {}) }, [])
-  const who = info?.payer === 'you'
-    ? t('Sent straight to {0} with your own API key. You pay for every request.', info.host || info.providerLabel)
-    : t('Sent to {0}, running on this server under the instance owner’s account.', info?.providerLabel || config?.coach?.providerLabel || t('the configured AI provider'))
-  return <>
-    <div className="ob-eyebrow">{t('Before we start')}</div>
-    <h1 className="ob-h">{t('Meet the Coach')}</h1>
-    <p className="ob-p">{t('It designs your plan from a few answers and adjusts it from what you actually log. It never changes anything without your say-so, and you can undo every change.')}</p>
-    <div className="ob-sub" style={{ marginTop: 0 }}>{t('What it reads')}</div>
-    <div className="ob-consent">
-      {(info?.categories || Object.keys(CATEGORY_TEXT)).map(k => {
-        const [title, sub] = CATEGORY_TEXT[k]?.() || [k, '']
-        return <div key={k} className="ob-consent-row"><Icon name="check" /><div><b>{title}</b><span>{sub}</span></div></div>
-      })}
-    </div>
-    <div className="ob-fine">
-      <div>{who}</div>
-      <div>{t('Your name, your sign-in details and everything else about your account stay here. Other people’s data is never included.')}</div>
-      <div style={{ color: 'var(--yellow)' }}>{t('The Coach is not a doctor or a physiotherapist. If something hurts, ask a professional.')}</div>
-    </div>
-    <div className="ob-foot" style={{ flexDirection: 'column' }}>
-      <Button variant="primary" onClick={onAgree}>{t('I understand, let’s go')}</Button>
-      <Button onClick={onDecline}>{t('Not now')}</Button>
-    </div>
-  </>
 }

@@ -178,10 +178,10 @@ export default function AdminCoach() {
     <div className="adm-hero">
       <div className="adm-hero-av"><Icon name="sparkles" /></div>
       <h2>AI Coach</h2>
-      <p>An optional coach that designs training plans and reviews what people actually log. Off right now, so nobody sees it anywhere in the app.</p>
+      <p>An optional assistant that answers questions about training and, with the user's yes, edits their plan, workouts and settings. Off right now, so nobody sees it anywhere in the app.</p>
       <div className="adm-hero-feats">
-        <div><Icon name="key" /><span><b>Bring any AI.</b> An API key from Anthropic, OpenAI or Gemini, or a free local model via Ollama.</span></div>
-        <div><Icon name="shield" /><span><b>Private by design.</b> A strict allowlist decides what leaves; every change needs the user's yes and can be undone.</span></div>
+        <div><Icon name="key" /><span><b>Claude or the Anthropic API.</b> The assistant looks things up and proposes edits through tools, which only those two can run.</span></div>
+        <div><Icon name="shield" /><span><b>Private by design.</b> It sees one profile, through lookups bound to that profile; every change needs the user's yes and can be undone.</span></div>
         <div><Icon name="person" /><span><b>Each user decides.</b> Turning it on only makes the Coach available; every person consents for themselves.</span></div>
       </div>
       <Button variant="primary" icon="sparkles" disabled={busy} onClick={() => patch({ enabled: true })}>Set up the Coach</Button>
@@ -207,6 +207,7 @@ export default function AdminCoach() {
       {/* ---------- provider ---------- */}
       <Step n={num()} title="Provider" hint={meta.label || 'Which AI answers the Coach'} done={step1Done} {...stepAt()}>
         <div className="adm-hint">Pick who answers. A key or token you save stays with its provider, so you can switch back and forth without pasting it again.</div>
+        {d.assistant === false && <div className="adm-hint" style={{ color: 'var(--yellow)' }}>This provider answers a connection test, but it cannot run the assistant, which needs tools: only Claude (Anthropic) and the Anthropic API can. Users will see a message saying so instead of a chat.</div>}
         {groups.map(g => !!g.items.length && <div key={g.title} className="adm-group">
           <div className="adm-group-t">{g.title}</div>
           <div className="adm-chips">
@@ -335,11 +336,11 @@ export default function AdminCoach() {
           <div className="adm-kv"><span className="k">Whole instance, per day</span>
             <span className="v"><input className="num" type="number" min="0" max="5000" defaultValue={d.caps.instanceDaily} disabled={busy}
               onBlur={capBlur('instanceDaily')} /></span></div>
-          <div className="adm-hint" style={{ marginTop: 10 }}>How long a chat message, refinement or review note can be. The chat composer and the server both enforce this.</div>
+          <div className="adm-hint" style={{ marginTop: 10 }}>How long a chat message can be. The chat composer and the server both enforce this.</div>
           <div className="adm-kv"><span className="k">Max message length</span>
             <span className="v"><input className="num" type="number" min="200" max="4000" defaultValue={d.maxMessageLen} disabled={busy}
               onBlur={e => +e.target.value !== d.maxMessageLen && patch({ maxMessageLen: +e.target.value })} /></span></div>
-          <div className="adm-hint" style={{ marginTop: 10 }}>The ceiling on a single provider answer. Reasoning models — DeepSeek-style endpoints, or a "thinking" Gemini/OpenAI model — count their hidden reasoning against it, so a plan can fail with "the answer was cut off at the output limit" even though the plan itself is short. Raise it if that happens; keep it within the model's own output limit.</div>
+          <div className="adm-hint" style={{ marginTop: 10 }}>The ceiling on a single provider answer. Reasoning models — DeepSeek-style endpoints, or a "thinking" Gemini/OpenAI model — count their hidden reasoning against it, so an answer can fail with "the answer was cut off at the output limit" even though the answer itself is short. Raise it if that happens; keep it within the model's own output limit.</div>
           <div className="adm-kv"><span className="k">Max output tokens</span>
             <span className="v"><input className="num" type="number" min="1024" max="65536" defaultValue={d.maxOutputTokens} disabled={busy}
               onBlur={e => +e.target.value !== d.maxOutputTokens && patch({ maxOutputTokens: +e.target.value })} /></span></div>
@@ -393,7 +394,7 @@ export default function AdminCoach() {
           <div className="adm-group-t">Recent jobs</div>
           {d.recent?.length ? <div className="adm-log">
             {d.recent.slice(0, 10).map((e, i) => <div key={i} className="adm-log-row">
-              <span>{e.kind === 'create' ? 'Plan' : 'Review'}{e.trigger === 'scheduled' ? ' · scheduled' : ''} · <span style={{ color: e.outcome === 'failed' ? 'var(--red)' : e.outcome === 'ready' ? 'var(--acc)' : 'var(--label-2)' }}>{e.outcome}</span>{e.ms ? ' · ' + Math.round(e.ms / 1000) + ' s' : ''}</span>
+              <span>{e.kind === 'chat' ? 'Message' : e.kind === 'create' ? 'Plan' : 'Review'}{e.trigger === 'scheduled' ? ' · scheduled' : ''} · <span style={{ color: e.outcome === 'failed' ? 'var(--red)' : e.outcome === 'ready' ? 'var(--acc)' : 'var(--label-2)' }}>{e.outcome}</span>{e.ms ? ' · ' + Math.round(e.ms / 1000) + ' s' : ''}</span>
               <span className="when">{rel(e.at)}</span>
             </div>)}
           </div> : <div className="adm-empty">No jobs yet.</div>}
@@ -446,7 +447,10 @@ const failureTitle = cls => ({
   missing: 'The provider runtime or key is missing',
   auth: 'The provider rejected the credential',
   provider: 'The provider returned an error',
-  unusable: 'The model answered, but not in a shape the app could use',
+  unusable: 'The assistant answered with nothing the app could show',
+  tools: 'The configured provider cannot run the assistant (it needs Claude or the Anthropic API)',
+  consent: 'The profile withdrew its go-ahead before the job ran',
+  forgotten: 'The profile cleared its Coach data while the job ran',
   restart: 'The server restarted while a job was running',
   nostate: 'The user\'s training data could not be read',
   off: 'The Coach was off when the job ran',

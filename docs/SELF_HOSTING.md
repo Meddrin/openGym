@@ -246,8 +246,8 @@ server to ask and is unaffected.
 
 Until someone picks a language, it is worked out on each device and not saved with the profile:
 without `DEFAULT_LANG`, the same profile can show in German on one phone and in English on a
-laptop, and the Coach answers in whichever the app is showing. A scheduled review, which no app
-asks for, is written in `DEFAULT_LANG` when it is set.
+laptop, and the Coach answers in whichever the app is showing, unless a message is written in
+another language. A profile that never picked one gets `DEFAULT_LANG` when it is set.
 
 ### The activity log
 
