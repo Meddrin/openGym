@@ -6,14 +6,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { EXALIAS } from './exercises-data.js'
 import { EXIDX, canonicalExId } from './exercises.js'
 import { mergePlan, parsePlan } from './plan-share.js'
-import { applyChangeSet, CONSENT_VERSION } from './coach.js'
+import { applyPlanChange, CONSENT_VERSION } from './coach.js'
 import { HEVY_ID_MAP, parseHevyWorkouts } from './import-hevy.js'
 
 const [ALIAS, TO] = Object.entries(EXALIAS).find(([id, to]) => EXIDX[to] && !Object.keys(EXIDX).includes(id))
 const state = () => ({
   unit: 'kg', lang: 'en', customEx: [], workouts: [], bodyweight: [], exWeights: {}, dayPlan: {}, week: {},
   routines: [{ id: 'r1', name: 'Old', ex: [{ id: ALIAS, sets: 3, reps: 10, mode: 'reps' }, { id: '0001', sets: 3, reps: 10, mode: 'reps' }] }],
-  coach: { consent: { agreedAt: '2026-07-01T00:00:00Z', version: CONSENT_VERSION }, log: [], snapshots: [], cadence: 'off' },
+  coach: { consent: { agreedAt: '2026-07-01T00:00:00Z', version: CONSENT_VERSION }, log: [], snapshots: [] },
 })
 const plan = ex => JSON.stringify({ opengym_plan: 1, unit: 'kg', routines: [{ id: 'p1', name: 'Shared', ex }], customEx: [] })
 
@@ -50,13 +50,11 @@ describe('a drawing id on its way in', () => {
 
   it('the Coach: an added, swapped-in or new-routine exercise', () => {
     const s = state()
-    applyChangeSet(s, {
-      id: 'p', kind: 'review', changes: [
-        { id: 'a', type: 'add-exercise', target: { routineId: 'r1' }, after: { id: ALIAS, sets: 3, reps: 8 } },
-        { id: 'b', type: 'swap-exercise', target: { routineId: 'r1', exId: '0001' }, after: { id: ALIAS } },
-        { id: 'c', type: 'add-routine', target: {}, after: { name: 'New', ex: [{ id: ALIAS, sets: 3, reps: 8 }] } },
-      ]
-    }, ['a', 'b', 'c'])
+    for (const c of [
+      { id: 'a', type: 'add-exercise', target: { routineId: 'r1' }, after: { id: ALIAS, sets: 3, reps: 8 } },
+      { id: 'b', type: 'swap-exercise', target: { routineId: 'r1', exId: '0001' }, after: { id: ALIAS } },
+      { id: 'c', type: 'add-routine', target: {}, after: { name: 'New', ex: [{ id: ALIAS, sets: 3, reps: 8 }] } },
+    ]) applyPlanChange(s, c)
     expect(s.routines[0].ex.map(e => e.id)).toEqual([ALIAS, TO, TO])
     expect(s.routines[1].ex[0].id).toBe(TO)
   })

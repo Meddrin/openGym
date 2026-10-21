@@ -71,7 +71,7 @@ function bestIn(workout, id) {
 // edit took it away — a typed 1000 corrected to 100, or deleted with the rest of the workout. Then
 // it is the best set left in history, or gone. One confirmed anywhere else ("Tracked — next time
 // starts at…") is left as it is. `saved` is the record after the edit, null once it is deleted.
-function lowerKeptWeights(state, ids, current, saved) {
+export function lowerKeptWeights(state, ids, current, saved) {
   for (const id of ids) {
     const kept = state.exWeights?.[id]
     const before = bestIn(current, id)

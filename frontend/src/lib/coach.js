@@ -1,47 +1,40 @@
-// The AI Coach, on the client side: everything that decides what a proposal *does* to a plan.
+// The AI Coach, on the client side: what a proposal looks like on a card, and the plan appliers.
 //
-// The server produces proposals; it never writes into your state. Applying one is ordinary
-// local editing — snapshot, mutate the draft, log — which is what makes it work offline, sync
-// like every other change, and stay reversible without the server knowing anything about it.
+// The assistant never writes into your state. Its proposals arrive in the chat as change sets;
+// applying one is ordinary local editing — snapshot, mutate the draft, log — which is what makes
+// it work offline, sync like every other change, and stay reversible without the server knowing
+// anything about it. That engine is lib/coach-changes.js. This file is the light half that the
+// rest of the app may import without dragging the exercise catalogue along: the gate, the consent
+// wording, the plan appliers (one per plan change type) and the words for a card.
 //
-// Every function here is pure over a draft state `s` (call them inside store.update), so the
-// interesting parts are testable without a browser, a server or an AI account. That matters
-// more here than elsewhere in the app: this is the code that edits a plan on the strength of
-// something a language model said, and "it looked right on my phone" is not a standard.
-//
-// The screens that call it arrive in PR 4. Nothing in this file needs one to be tested, which
-// is the point of it being separate from them.
+// Every applier is pure over a draft state `s` (call it inside store.update), so the interesting
+// parts are testable without a browser, a server or an AI account. That matters more here than
+// elsewhere in the app: this is the code that edits a plan on the strength of something a
+// language model said, and "it looked right on my phone" is not a standard.
 
 import { EXIDX, canonicalExId } from './exercises.js'
-import { modeOf, isBw, isPerSide, cleanupSg } from './history.js'
-import { uid, todayISO, DAYN } from './format.js'
-import { mergePlan } from './plan-share.js'
+import { cleanupSg } from './history.js'
+import { uid, DAYN, fmtDate } from './format.js'
 import { deleteRoutine } from './routines.js'
 import { POLICIES } from './progression.js'
-import { t, tn } from './i18n.js'
+import { t } from './i18n.js'
 
 // Bumping this re-prompts everyone: it means what we share, or who we share it with, changed.
 // 2: the training line names the session notes, which the payload carries and version 1 never
 // mentioned.
-export const CONSENT_VERSION = 2
+// 3: the Coach is an assistant now. Nothing is sent up front; it looks things up as it answers,
+// through tools, and it keeps a conversation with you. The screen says so in new words.
+export const CONSENT_VERSION = 3
 
 // Bounds. The whole state has to stay inside the server's 5 MB body limit, and a Coach log
-// that grows forever is exactly the kind of thing that eats it invisibly. Worst case here is
-// ~75 KB; the namespace guard is the backstop for the case nobody predicted.
+// that grows forever is exactly the kind of thing that eats it invisibly. The namespace guard is
+// the backstop for the case nobody predicted.
 export const SNAPSHOT_MAX = 3
 export const LOG_MAX = 50
-export const CHAT_MAX = 40
-export const TIMINGS_MAX = 5
 const NAMESPACE_MAX = 256 * 1024
 
 export const emptyCoach = () => ({
-  consent: null, profile: null, cadence: 'off', lastReview: null, log: [], snapshots: [],
-  // The conversation as the user saw it (views/CoachChat.jsx): their messages, and what the
-  // Coach did with them. Short, synced, and trimmed with the log — the proposal itself lives
-  // server-side (or in the phone's device file) until it is applied or dismissed.
-  chat: [],
-  // How long the last few jobs took, so the typing bubble can say "usually about 2 minutes".
-  timings: []
+  consent: null, profile: null, log: [], snapshots: []
 })
 const coachOf = s => (s.coach = s.coach || emptyCoach())
 
@@ -51,7 +44,7 @@ const coachOf = s => (s.coach = s.coach || emptyCoach())
 // makes "an instance with no provider is byte-identical to before" a claim worth testing.
 //
 // The demo build is the one exception, and it is deliberate: it has no backend and no
-// account, but it does have a canned provider, and hiding the app's most interesting feature
+// account, but it does have a canned assistant, and hiding the app's most interesting feature
 // from the page people are sent to look at it on would be a strange choice.
 //
 // The mobile build has two ways in, both chosen in Settings (views/CoachSetup.jsx): a phone
@@ -62,79 +55,21 @@ export const coachAvailable = (config, user, { demo, mobile, coachMode } = {}) =
   mobile ? (coachMode === 'byok' || !!(config?.coach?.enabled && user))
     : demo ? true : !!(config?.coach?.enabled && user)
 
-// What each data category means, in the user's words. Rendered from the same list the payload
-// builder uses (api/coach/core/categories.js), so the screen cannot promise less than leaves.
+// What each data category means, in the user's words. Rendered from the same list the server
+// defines (api/coach/core/categories.js), so the screen cannot promise less than can leave.
 // Each entry returns [title, detail] in the current language, through literal t() calls so
-// check-source-strings sees every key. When the screens passed these to t() as variables the
-// checker could not see them, and eight of the ten had no translation in any pack.
+// check-source-strings sees every key.
 export const CATEGORY_TEXT = {
   plan: () => [t('Your plan'), t('Routines, exercises, sets and reps, your weekly schedule and progression settings.')],
-  training: () => [t('Your logged training'), t('Sets you logged in the review window: weights, reps, times, effort ratings, how long sessions took, and your session notes.')],
-  bodyweight: () => [t('Body weight'), t('Weigh-ins from the same window, and your goal weight if you set one.')],
-  profile: () => [t('What you tell the Coach'), t('Your intake answers, including any limitations or injuries you describe.')],
-  prefs: () => [t('A few preferences'), t('Your unit, your language and which effort scale you log.')]
+  training: () => [t('Your logged training'), t('Workouts it looks up while it answers: weights, reps, times, effort ratings, how long sessions took, and your session notes.')],
+  bodyweight: () => [t('Body weight'), t('Weigh-ins, and your goal weight if you set one.')],
+  profile: () => [t('What you tell the Coach'), t('Your intake answers, including any limitations or injuries you describe, your own exercises and your notes on exercises.')],
+  prefs: () => [t('A few preferences'), t('Your unit, your language, which effort scale you log, and rest timers.')],
+  chat: () => [t('Your conversation'), t('What you write to it, and what it answered recently, so it can follow the thread.')]
 }
 export const hasConsent = S => !!S?.coach?.consent?.agreedAt && S.coach.consent.version === CONSENT_VERSION
 
-/* ============================ plan fingerprint ============================ */
-
-/**
- * Mirror of `canonicalPlan` in api/coach/payload.js — field for field, including the rule
- * that every absent value is written out as a zero so "no weight" and "0 kg" cannot hash
- * apart, and that `bodyweight`/`side` are *resolved* against the catalogue rather than copied,
- * so a plan that says nothing and an exercise the dataset already calls bodyweight hash the
- * same. If you change one, change both; coach.test.js checks them against shared fixtures.
- */
-export function canonicalPlan(S) {
-  return {
-    routines: (S.routines || []).map(r => ({
-      id: r.id, name: r.name || '', prog: r.prog || '',
-      ex: (r.ex || []).map(e => {
-        const mode = modeOf(e)
-        return {
-          id: e.id, mode, sets: e.sets || 0,
-          reps: mode === 'reps' ? (e.reps || 0) : 0,
-          sec: mode === 'time' ? (e.sec || 0) : 0,
-          min: mode === 'cardio' ? (e.min || 0) : 0,
-          speed: mode === 'cardio' ? (e.speed || 0) : 0,
-          weight: mode === 'cardio' ? 0 : (e.weight || 0),
-          prog: e.prog || '', inc: e.inc || 0, repsMin: e.repsMin || 0, repsMax: e.repsMax || 0,
-          bodyweight: isBw(e), side: isPerSide(e),
-          sg: e.sg || ''
-        }
-      })
-    })),
-    // A weekday holds a routine-id list now. `[].concat` folds a legacy bare string and a
-    // one-element list to the same shape, so their fingerprint is identical — no false-stale
-    // storm on the first load after the upgrade. `?.length` keeps a stray `[]` out. Insertion
-    // order is preserved and never sorted (it is the merge order).
-    week: Object.fromEntries([1, 2, 3, 4, 5, 6, 0].filter(d => S.week?.[d]?.length).map(d => [d, [].concat(S.week[d])]))
-  }
-}
-
-/** FNV-1a-ish 64-bit fingerprint. Mirror of hashPlan in api/coach/core/plan-hash.js. */
-export function hashPlan(plan) {
-  const canon = JSON.stringify({
-    routines: (plan?.routines || []).map(r => [r.id, r.name, r.prog, (r.ex || []).map(e =>
-      [e.id, e.mode, e.sets, e.reps, e.sec, e.min, e.speed, e.weight, e.prog, e.inc,
-        e.repsMin, e.repsMax, e.bodyweight, e.side, e.sg].join(':')
-    )]),
-    // `plan` is a canonicalPlan output, so each day is already an array. `{1:['r1']}` → "1=r1",
-    // byte-identical to the pre-upgrade fingerprint; `{3:['r2','r3']}` → "3=r2+r3". Weekday
-    // keys still sorted; the routine list within a day never is.
-    week: Object.keys(plan?.week || {}).sort().map(k => k + '=' + [].concat(plan.week[k]).join('+'))
-  })
-  let h1 = 0x811c9dc5, h2 = 0x01000193
-  for (let i = 0; i < canon.length; i++) {
-    const c = canon.charCodeAt(i)
-    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0
-    h2 = Math.imul(h2 ^ ((c << 3) | i & 7), 0x85ebca6b) >>> 0
-  }
-  return h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0')
-}
-export const planHash = S => hashPlan(canonicalPlan(S))
-
-/* ============================ staleness ============================ */
+/* ============================ plan changes ============================ */
 
 const findRoutine = (S, id) => (S.routines || []).find(r => r.id === id) || null
 const findEx = (routine, id) => (routine?.ex || []).find(e => e.id === id) || null
@@ -146,278 +81,7 @@ const findEx = (routine, id) => (routine?.ex || []).find(e => e.id === id) || nu
 // pins the two together.
 export const ROUTINE_NAME_SEEN = 80
 
-/** The plan's current value for whatever a change is about — what `before` is checked against. */
-export function currentValue(S, change) {
-  const r = findRoutine(S, change.target?.routineId)
-  const e = change.target?.exId ? findEx(r, change.target.exId) : null
-  switch (change.type) {
-    case 'sets': return e?.sets ?? null
-    case 'reps': return e?.reps ?? null
-    case 'repsMin': return e?.repsMin ?? null
-    case 'repsMax': return e?.repsMax ?? null
-    case 'sec': return e?.sec ?? null
-    case 'inc': return e?.inc ?? null
-    case 'exercise-prog': return e?.prog ?? null
-    case 'routine-prog': return r?.prog ?? null
-    case 'rename-routine': return r?.name == null ? null : String(r.name).slice(0, ROUTINE_NAME_SEEN)
-    case 'week': return [].concat(S.week?.[change.target?.weekday] ?? [])   // routine-id list; [] = rest
-    default: return undefined            // structural changes have no single scalar to compare
-  }
-}
-
-/**
- * Mark what can no longer be applied. Two independent checks, because they fail differently:
- * the whole proposal is stale when the plan has moved since it was computed, and an individual
- * change is stale when the thing it names is gone or has already been changed by hand.
- *
- * A stale change is disabled, never silently skipped — someone who edited their plan on
- * another device should be told why the suggestion is greyed out.
- */
-export function markStale(proposal, S) {
-  if (!proposal) return proposal
-  const planMoved = !!proposal.planHash && proposal.planHash !== planHash(S)
-  const changes = (proposal.changes || []).map(c => {
-    const r = c.target?.routineId ? findRoutine(S, c.target.routineId) : null
-    let stale = false
-    if (c.type !== 'add-routine' && c.type !== 'week' && !r) stale = true
-    else if (c.target?.exId && !findEx(r, c.target.exId)) stale = true
-    else if (c.type === 'week') {
-      // The day's value is a routine-id list; `before` may be a list (a combined day) or a
-      // legacy bare string. Compare by canonical join so order matters but shape does not.
-      const join = v => [].concat(v ?? []).join('+')
-      if (c.before != null && join(currentValue(S, c)) !== join(c.before)) stale = true
-    }
-    else {
-      const cur = currentValue(S, c)
-      // `before` is what the Coach saw. If the live plan disagrees, someone has already
-      // changed it — applying would silently overwrite their edit with a stale premise.
-      if (cur !== undefined && c.before != null && cur !== c.before && cur !== null) stale = true
-    }
-    return { ...c, status: stale ? 'stale' : (c.status === 'stale' ? 'proposed' : c.status || 'proposed') }
-  })
-  return { ...proposal, planMoved, changes }
-}
-export const applicable = proposal => (proposal?.changes || []).filter(c => c.status !== 'stale')
-
-/* ============================ validation ============================ */
-
-/** Client-side mirror of the server's gate — the plan must survive a bad day at either end. */
-export function validateProposal(p) {
-  if (!p || typeof p !== 'object') throw new Error(t('That proposal can’t be read.'))
-  if (p.bundle) {
-    if (!Array.isArray(p.bundle.routines) || !p.bundle.routines.length) throw new Error(t('That proposal can’t be read.'))
-    // The server rejects a routine with no exercises; so must this, or an empty one is appended,
-    // gets scheduled, and "start today's session" opens a workout with nothing in it.
-    for (const r of p.bundle.routines) {
-      if (!Array.isArray(r.ex) || !r.ex.length) throw new Error(t('That proposal can’t be read.'))
-    }
-    return true
-  }
-  if (!Array.isArray(p.changes)) throw new Error(t('That proposal can’t be read.'))
-  for (const c of p.changes) {
-    if (!CHANGE_APPLY[c.type]) throw new Error(t('That proposal can’t be read.'))
-  }
-  return true
-}
-
-/* ============================ snapshots & revert ============================ */
-
 const clone = o => JSON.parse(JSON.stringify(o))
-
-/**
- * Remember the `dayPlan` entries an apply step deleted, on the snapshot that will undo it.
- *
- * A patch, not a clone: `dayPlan` holds every date the user ever rescheduled, and three copies
- * of it in the snapshot ring would crowd real snapshots out of the 256 KB namespace budget that
- * `trim()` enforces. The first value recorded for a date wins — that is the pre-apply one.
- */
-function recordDayPlanDrops(s, dropped) {
-  if (!Object.keys(dropped).length) return
-  const snaps = coachOf(s).snapshots || []
-  const snap = snaps[snaps.length - 1]
-  if (!snap) return
-  snap.dayPlanRestore = { ...dropped, ...(snap.dayPlanRestore || {}) }
-}
-
-/**
- * Drop per-date reschedules from `iso` onwards.
- *
- * A created plan replaces the whole week, so overrides made against the old one are no longer
- * about anything: `'rest'` would hide a session the new plan schedules, and a routine id wins
- * over the new week on that day. Past dates stay — those are history, not intent.
- */
-function sweepDayPlan(s, fromIso) {
-  const dropped = {}
-  Object.keys(s.dayPlan || {}).forEach(iso => {
-    if (iso >= fromIso) { dropped[iso] = s.dayPlan[iso]; delete s.dayPlan[iso] }
-  })
-  recordDayPlanDrops(s, dropped)
-}
-
-/** Snapshot `{routines, week}` before touching either. The unit of revert (FR-30/31). */
-export function pushSnapshot(s, proposalId, label) {
-  const c = coachOf(s)
-  c.snapshots = [...(c.snapshots || []), {
-    at: Date.now(), proposalId: proposalId || null, label: label || '',
-    routines: clone(s.routines || []), week: clone(s.week || {})
-  }].slice(-SNAPSHOT_MAX)
-  trim(s)
-}
-
-/**
- * Put the plan back the way it was before the last applied change-set.
- *
- * Workouts are untouched, and that is not an oversight: the log is what happened. Reverting a
- * plan re-derives every future target from that same history, which is exactly what the
- * progression engine does anyway.
- */
-export function revertLast(s) {
-  const c = coachOf(s)
-  const snap = (c.snapshots || []).pop()
-  if (!snap) return false
-  s.routines = clone(snap.routines)
-  s.week = clone(snap.week)
-  // Snapshots taken before this field existed have nothing to put back.
-  if (snap.dayPlanRestore) Object.assign(s.dayPlan, snap.dayPlanRestore)
-  appendLog(s, { kind: 'revert', at: Date.now(), proposalId: snap.proposalId, summary: t('Reverted the last Coach changes.') })
-  return true
-}
-export const canRevert = S => !!(S?.coach?.snapshots || []).length
-
-/* ============================ the log ============================ */
-
-export function appendLog(s, entry) {
-  const c = coachOf(s)
-  const e = { id: entry.id || uid(), ...entry }
-  c.log = [...(c.log || []), e].slice(-LOG_MAX)
-  trim(s)
-  return e.id
-}
-export const logEntry = (S, id) => (S?.coach?.log || []).find(e => e.id === id) || null
-
-/**
- * What a created plan looked like, small enough to keep: names, days and prescriptions, no
- * rationale text. The full bundle was merged into the plan already; this is what the chat
- * shows back when someone opens an old proposal months later.
- */
-export function lightBundle(b) {
-  if (!b) return null
-  return {
-    name: b.name || '', summary: b.summary || '', week: { ...(b.week || {}) },
-    routines: (b.routines || []).map(r => ({
-      id: r.id, name: r.name, emoji: r.emoji || '', why: r.why || '',
-      ex: (r.ex || []).map(e => ({
-        id: e.id, sets: e.sets, mode: e.mode || 'reps',
-        ...(e.reps != null ? { reps: e.reps } : {}), ...(e.sec != null ? { sec: e.sec } : {}),
-        ...(e.min != null ? { min: e.min } : {}), ...(e.weight ? { weight: e.weight } : {}),
-        ...(e.why ? { why: String(e.why).slice(0, 200) } : {})
-      }))
-    }))
-  }
-}
-const decisionOf = (c, status) => ({ id: c.id, type: c.type, target: c.target || null, before: c.before ?? null, after: c.after ?? null, why: c.why, routineName: c.routineName || null, status })
-
-
-/**
- * Last line of defence for the 5 MB sync body: if the Coach namespace ever outgrows its
- * budget, drop the oldest history rather than let a PUT start failing for reasons nobody
- * would connect to this feature.
- */
-function trim(s) {
-  const c = coachOf(s)
-  let guard = 0
-  while (JSON.stringify(c).length > NAMESPACE_MAX && guard++ < 60) {
-    if ((c.chat || []).length > 8) c.chat.shift()
-    else if ((c.snapshots || []).length > 1) c.snapshots.shift()
-    else if ((c.log || []).length > 1) c.log.shift()
-    else break
-  }
-}
-
-/* ============================ the conversation ============================ */
-
-/**
- * One line of the chat: `{ id, role: 'user'|'coach', kind, text?, at, ref? }`.
- * kinds — user: 'intake' (the questionnaire, rendered from the live profile), 'text';
- *         coach: 'text', 'applied', 'dismissed', 'reverted', 'error', 'nochange'.
- */
-export function appendChat(s, entry) {
-  const c = coachOf(s)
-  c.chat = [...(c.chat || []), { id: entry.id || uid(), at: entry.at || Date.now(), ...entry }].slice(-CHAT_MAX)
-  trim(s)
-}
-
-/** A job just finished: remember how long it took, for the next typing bubble. */
-export function recordTiming(s, ms) {
-  if (!(ms > 0)) return
-  const c = coachOf(s)
-  c.timings = [...(c.timings || []), Math.round(ms)].slice(-TIMINGS_MAX)
-}
-/**
- * What to promise in the typing bubble. Median of the observed runs, but never slower than
- * the most recent one: after a speed-up (a faster model, a warmed cache) the median drags
- * three old 8-minute runs along, and telling someone "about 8 min" for a one-minute job is
- * worse than being briefly optimistic. A slow outlier still cannot scare anyone — the median
- * wins in that direction.
- */
-export function estimateMs(S) {
-  const raw = (S?.coach?.timings || []).filter(n => n > 0)
-  if (!raw.length) return null
-  const sorted = [...raw].sort((a, b) => a - b)
-  return Math.min(sorted[Math.floor(sorted.length / 2)], raw[raw.length - 1])
-}
-
-/** The questionnaire, as the lines the chat shows back to the user. */
-export function profileLines(p) {
-  if (!p) return []
-  const goal = { strength: 'Get stronger', muscle: 'Build muscle', general: 'General fitness', fatloss: 'Lose fat', endurance: 'Endurance' }[p.goal]
-  const exp = { new: 'New to lifting', returning: 'Coming back after a break', regular: 'Training regularly' }[p.experience]
-  const lines = []
-  if (goal) lines.push(t(goal))
-  if (exp) lines.push(t(exp))
-  if (p.daysPerWeek) lines.push(tn('1 day a week', '{0} days a week', p.daysPerWeek))
-  if (p.sessionMin) lines.push(t('{0} min per session', p.sessionMin))
-  if (p.equipment?.length) lines.push(p.equipment.join(', '))
-  if (p.limitations) lines.push(t('Limits: {0}', p.limitations))
-  if (p.likes) lines.push(t('Likes: {0}', p.likes))
-  if (p.dislikes) lines.push(t('Avoid: {0}', p.dislikes))
-  if (p.notes) lines.push(p.notes)
-  return lines
-}
-
-/* ============================ applying a created plan ============================ */
-
-/**
- * Accepting a created plan is exactly importing a plan file (FR-18): routines arrive as new
- * ones with fresh ids, existing routines and history are never touched, and the week schedule
- * only moves if you asked it to.
- */
-export function applyCreatedPlan(s, proposal, { schedule } = {}) {
-  validateProposal(proposal)
-  pushSnapshot(s, proposal.id, t('Before the Coach’s plan'))
-  const bundle = proposal.bundle
-  // The Coach's `why` texts are for the review screen; they have no place in the routine data.
-  // A link is never the Coach's to write: validatePlan already drops one from the model's plan,
-  // and this drops it again on the way into mergePlan, which would otherwise carry a `url` on a
-  // plan's own exercises through to the profile (cleanCustom keeps links for shared plans).
-  const stripped = {
-    ...bundle,
-    routines: bundle.routines.map(r => ({ ...r, why: undefined, ex: r.ex.map(e => ({ ...e, why: undefined, name: undefined })) })),
-    customEx: (bundle.customEx || []).map(c => { const { url, media, ...rest } = c || {}; return rest })
-  }
-  const res = mergePlan(s, stripped, { schedule })
-  // Only when the week actually moved — with the switch off the old schedule still stands, and
-  // so do the reschedules made against it.
-  if (schedule) sweepDayPlan(s, todayISO())
-  res.logId = appendLog(s, {
-    kind: 'create', at: Date.now(), proposalId: proposal.id,
-    summary: proposal.summary || '', routines: res.routines, iteration: proposal.iteration || 1,
-    bundle: lightBundle(bundle), scheduled: !!schedule
-  })
-  return res
-}
-
-/* ============================ applying a change-set ============================ */
 
 // One implementation per allowed type. The object is the closed list on this side of the
 // wire: a type with no entry here cannot be applied, whatever the server let through.
@@ -523,9 +187,11 @@ const CHANGE_APPLY = {
   },
   'remove-routine': (s, c) => {
     // The same delete as Plan and RoutineEdit. It used to compare each weekday with ===, which
-    // missed a combined day (a list) and left the deleted id on it. The week comes back from the
-    // snapshot on a revert; the dropped reschedules are not in the snapshot, so they are recorded.
-    recordDayPlanDrops(s, deleteRoutine(s, c.target.routineId))
+    // missed a combined day (a list) and left the deleted id on it. The week and the reschedules
+    // come back from the snapshot on an Undo.
+    // The dropped reschedules are not lost: remove-routine snapshots the whole dayPlan first
+    // (lib/coach-changes.js), which is what an Undo puts back.
+    deleteRoutine(s, c.target.routineId)
   },
   'rename-routine': (s, c) => { need(findRoutine(s, c.target.routineId)).name = c.after },
   week: (s, c) => {
@@ -542,63 +208,55 @@ export const CHANGE_TYPES = Object.keys(CHANGE_APPLY)
 function findExIn(s, c) { return findEx(findRoutine(s, c.target.routineId), c.target.exId) }
 function need(x) { if (!x) throw new Error('missing target'); return x }
 
+
+/** Apply one plan change to the draft `s`. Throws when its target is gone, which discards the
+ *  whole set when this runs inside store.update. */
+export function applyPlanChange(s, c) {
+  const fn = CHANGE_APPLY[c.type]
+  if (!fn) throw new Error('unknown change type ' + c.type)
+  fn(s, c)
+}
+
+/* ============================ the log ============================ */
+
+export function appendLog(s, entry) {
+  const c = coachOf(s)
+  const e = { id: entry.id || uid(), ...entry }
+  c.log = [...(c.log || []), e].slice(-LOG_MAX)
+  trim(s)
+  return e.id
+}
+export const logEntry = (S, id) => (S?.coach?.log || []).find(e => e.id === id) || null
+
 /**
- * Apply the accepted subset, atomically (FR-30).
- *
- * Atomic comes free from how the store works: `update()` hands us a throwaway clone and only
- * keeps it if we return normally. Throwing part-way through therefore discards every change
- * this function already made, which is precisely the transaction we want — no half-applied
- * change-set, ever.
+ * Last line of defence for the 5 MB sync body: if the Coach namespace ever outgrows its
+ * budget, drop the oldest history rather than let a PUT start failing for reasons nobody
+ * would connect to this feature. The newest snapshot is what an Undo needs, so it goes last.
  */
-export function applyChangeSet(s, proposal, acceptedIds) {
-  validateProposal(proposal)
-  const accepted = new Set(acceptedIds || [])
-  const changes = (proposal.changes || []).filter(c => accepted.has(c.id) && c.status !== 'stale')
-  if (!changes.length) return { applied: 0 }
-
-  pushSnapshot(s, proposal.id, t('Before the Coach’s changes'))
-  const applied = []
-  for (const c of changes) {
-    CHANGE_APPLY[c.type](s, c)
-    applied.push(decisionOf(c, 'accepted'))
+export function trim(s) {
+  const c = coachOf(s)
+  let guard = 0
+  while (JSON.stringify(c).length > NAMESPACE_MAX && guard++ < 60) {
+    if ((c.log || []).length > 1) c.log.shift()
+    else if ((c.snapshots || []).length > 1) c.snapshots.shift()
+    else break
   }
-  // Turned-down changes keep their before/after too: the chat shows the whole proposal back
-  // later, and "you declined something about sets" is not a memory anyone can use.
-  const rejected = (proposal.changes || [])
-    .filter(c => !accepted.has(c.id))
-    .map(c => decisionOf(c, c.status === 'stale' ? 'stale' : 'rejected'))
-
-  const logId = appendLog(s, {
-    kind: 'review', at: Date.now(), proposalId: proposal.id,
-    summary: proposal.summary || '', evidence: proposal.evidence || null,
-    notes: proposal.notes || [], decisions: [...applied, ...rejected]
-  })
-  coachOf(s).lastReview = { at: Date.now() }
-  return { applied: applied.length, rejected: rejected.length, logId }
 }
 
-/** Turned down whole, or expired: recorded so a later review knows not to re-propose it. */
-export function recordDismissal(s, proposal) {
-  const logId = appendLog(s, {
-    kind: proposal.kind === 'create' ? 'create' : 'review', at: Date.now(), proposalId: proposal.id,
-    summary: proposal.summary || '', dismissed: true,
-    evidence: proposal.evidence || null, notes: proposal.notes || [],
-    ...(proposal.bundle ? { bundle: lightBundle(proposal.bundle), iteration: proposal.iteration || 1 } : {}),
-    decisions: (proposal.changes || []).map(c => decisionOf(c, 'rejected'))
-  })
-  if (proposal.kind !== 'create') coachOf(s).lastReview = { at: Date.now() }
-  return logId
+/** The snapshots, newest last. Kept here so the light half can say whether an Undo exists. */
+export const snapshotsOf = S => (S?.coach?.snapshots || [])
+/** Whether the proposal with this id is the one an Undo would put back (the newest apply). */
+export const canUndo = (S, proposalId) => {
+  const snaps = snapshotsOf(S)
+  return !!snaps.length && snaps[snaps.length - 1].proposalId === proposalId
 }
-
-/** A debrief has no decision to make: it is read, kept, and shown again on request. */
-export function recordDebrief(s, proposal) {
-  return appendLog(s, {
-    kind: 'debrief', at: Date.now(), proposalId: proposal.id,
-    workout: proposal.workout || null,
-    summary: proposal.summary || '', score: proposal.score ?? null,
-    highlights: proposal.highlights || [], watch: proposal.watch || [], nextTime: proposal.nextTime || []
-  })
+export const setSnapshots = (s, list) => { coachOf(s).snapshots = list.slice(-SNAPSHOT_MAX) }
+export const pushRawSnapshot = (s, snap) => {
+  const c = coachOf(s)
+  c.snapshots = [...(c.snapshots || []), snap].slice(-SNAPSHOT_MAX)
+  trim(s)
 }
+export const popSnapshot = s => (coachOf(s).snapshots || []).pop() || null
 
 /* ============================ display helpers ============================ */
 
@@ -608,7 +266,7 @@ export const exName = id => EXIDX[id]?.n || t('Unknown exercise')
 const cap = s => String(s || '').replace(/(^|\s)(\p{L})/gu, (m, sp, ch) => sp + ch.toUpperCase())
 export const exTitle = id => cap(exName(id))
 
-/** Human label for a change, used on the review screen and in the log. */
+/** Human label for a plan change, used on the card and in the log. */
 export function changeTitle(c, S) {
   const ex = c.target?.exId ? exTitle(c.target.exId) : null
   switch (c.type) {
@@ -653,4 +311,35 @@ export function changeValues(c, S) {
   if (['add-exercise', 'add-routine', 'reorder'].includes(c.type)) return null
   if (['remove-exercise', 'remove-routine'].includes(c.type)) return null
   return { before: fmt(c.before), after: fmt(c.after) }
+}
+
+/* ============================ the card ============================ */
+
+const KIND_TITLE = {
+  dayplan: c => t('Plan for {0}', fmtDate(c.target?.date)),
+  'workout-add': c => t('Log a workout on {0}', fmtDate(c.after?.d)),
+  'workout-edit': c => t('Edit the workout of {0}', fmtDate(c.workoutDate)),
+  'workout-delete': c => t('Delete the workout of {0}', fmtDate(c.workoutDate)),
+  'bodyweight-set': c => t('Body weight on {0}', fmtDate(c.target?.date)),
+  'bodyweight-delete': c => t('Delete the weigh-in of {0}', fmtDate(c.target?.date)),
+  'exnote-set': c => t('Note on {0}', exTitle(c.target?.exId)),
+  'custom-ex-add': c => t('New exercise “{0}”', c.after?.n),
+  'custom-ex-edit': c => t('Edit your exercise “{0}”', c.lines?.[0]?.k?.split(':')[0] || ''),
+  'custom-ex-delete': c => t('Delete your exercise “{0}”', c.before),
+  setting: c => t('Setting: {0}', c.target?.key),
+  'profile-set': () => t('Your coach profile')
+}
+export const isPlanChange = c => !!c && !KIND_TITLE[c.type]
+
+/**
+ * A change as the card shows it: a title, and rows of before/after. Plan changes read their
+ * values off the live plan (names, not ids); every other kind carries its own `lines`, plain
+ * strings the server worked out, which keeps reading right after the data has moved on.
+ */
+export function describeChange(c, S) {
+  if (KIND_TITLE[c.type]) {
+    return { title: KIND_TITLE[c.type](c), rows: (c.lines || []).map(l => ({ label: l.k, before: l.before, after: l.after })) }
+  }
+  const v = changeValues(c, S)
+  return { title: changeTitle(c, S), rows: v ? [{ label: null, before: v.before, after: v.after }] : [] }
 }

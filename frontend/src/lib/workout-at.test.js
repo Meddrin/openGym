@@ -59,7 +59,7 @@ describe('muscleBalanceWindow dates its cutoff the same way', () => {
 })
 
 /* Several call sites had their own copy of the rule: Stats.jsx twice, recovery.js, effort.js,
-   coach-demo.js, coach-insights.js, muscles.js, strength-exercises.js and the MCP server's
+   coach-demo.js, muscles.js, strength-exercises.js and the MCP server's
    muscle_balance. A grep is the only guard that would have caught that, so here it is. */
 describe('nothing re-implements the rule', () => {
   it('no source file dates a workout by hand', async () => {
