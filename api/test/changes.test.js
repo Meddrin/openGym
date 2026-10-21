@@ -123,6 +123,29 @@ test('every allowed kind has a good instance that validates, and each data kind 
   }
 });
 
+test('a validated change set validates again to the same thing — which is how the client checks it before applying', () => {
+  for (const type of CHANGE_KINDS) {
+    const S = state();
+    const first = ok(S, [{ ...GOOD[type], why }]);
+    const again = validateChangeSet(S, { summary: 's', changes: first.changes }, { ...ctx, newId: () => 'a-different-id' });
+    assert.equal(again.ok, true, `${type}: ${JSON.stringify(again.errors)}`);
+    assert.deepEqual(again.changes, first.changes, type);
+  }
+  // …including a workout edit whose patch adds an exercise and edits sets, and a workout that is added.
+  const S = state();
+  const r = ok(S, [
+    { type: 'workout-edit', target: { workoutId: 'w1' }, why, after: { note: 'n', entries: [{ index: 0, sets: [{ index: 0, r: 11, rpe: null }, { index: 1 }, { index: 2 }, { r: 6, w: 20, warmup: true }], note: 'x' }, { id: '0009', sets: [{ r: 8, w: 40 }] }] } },
+    { ...GOOD['workout-add'], why }
+  ]);
+  assert.deepEqual(validateChangeSet(S, { changes: r.changes }, ctx).changes, r.changes);
+  // A state that has moved on is visible as a different `before`, never as a quiet success.
+  const moved = structuredClone(S);
+  moved.workouts[0].entries[0].sets[0].r = 3;
+  const stale = validateChangeSet(moved, { changes: r.changes }, ctx);
+  assert.equal(stale.ok, true);
+  assert.notDeepEqual(stale.changes[0].before, r.changes[0].before);
+});
+
 test('before is read off the state, never taken from the model', () => {
   const S = state();
   const r = ok(S, [

@@ -106,7 +106,8 @@ function cleanSet(raw, where, errors) {
   if (!hasWork(out)) { errors.push(`${where} needs at least one of r (reps), w (weight), sec, min`); return null; }
   if (out.rir != null && out.rpe != null) { errors.push(`${where} carries both rir and rpe — give one`); return null; }
   out.done = raw.done === false ? false : true;
-  if (raw.warmup === true) out.phase = 'warmup';
+  // `phase: 'warmup'` is the stored form, so a change that was validated once validates again.
+  if (raw.warmup === true || raw.phase === 'warmup') out.phase = 'warmup';
   else if (raw.failure === true) out.failure = true;
   return out;
 }
@@ -130,11 +131,20 @@ function patchSet(old, patch, where, errors) {
   return merged;
 }
 
-/** The sets of one entry. `base` is the entry's existing sets when it is being edited. */
+const PATCH_KEYS = [...SET_FIELDS, 'done', 'warmup', 'failure'];
+const pick = (raw, keys) => Object.fromEntries(keys.filter(k => raw[k] !== undefined).map(k => [k, raw[k]]));
+
+/**
+ * The sets of one entry, as { finished, patch }, or null when the list itself is unusable.
+ * `base` is the entry's existing sets when it is being edited. `patch` is the cleaned form of
+ * what was asked for (an edit of an existing set keeps its `index`, a new set is whole): it is
+ * what a change stores, so applying later works from the live workout and validating it again
+ * gives the same answer.
+ */
 function mergeSets(rawSets, base, where, errors) {
   if (!Array.isArray(rawSets) || !rawSets.length) { errors.push(`${where}.sets must list at least one set`); return null; }
   if (rawSets.length > 30) { errors.push(`${where}.sets lists more than 30 sets`); return null; }
-  const out = [];
+  const finished = [], patch = [];
   const used = new Set();
   rawSets.forEach((raw, i) => {
     const w = `${where}.sets[${i}]`;
@@ -145,16 +155,59 @@ function mergeSets(rawSets, base, where, errors) {
         return;
       }
       used.add(raw.index);
-      const patch = { ...raw }; delete patch.index;
-      if (!Object.keys(patch).length) { out.push(old); return; }
-      const merged = patchSet(old, patch, w, errors);
-      if (merged) out.push(merged);
+      const fields = pick(raw, PATCH_KEYS);
+      if (!Object.keys(fields).length) { finished.push(old); patch.push({ index: raw.index }); return; }
+      const merged = patchSet(old, fields, w, errors);
+      if (merged) { finished.push(merged); patch.push({ index: raw.index, ...fields }); }
       return;
     }
     const cleaned = cleanSet(raw, w, errors);
-    if (cleaned) out.push(cleaned);
+    if (cleaned) { finished.push(cleaned); patch.push(cleaned); }
   });
-  return out;
+  return { finished, patch };
+}
+
+/**
+ * The entries of a workout after an edit, as { finished, patch }. `rawEntries` lists EVERY
+ * exercise that should remain: `{index}` keeps or edits an existing one, `{id, sets}` adds one,
+ * and one left out is removed. Run by validation, and again by the apply on the live workout.
+ */
+function buildEntries(S, w, rawEntries, ctx, bad) {
+  const have = list(w.entries);
+  const seen = new Set();
+  const finished = [], patch = [];
+  rawEntries.slice(0, 30).forEach((e, i) => {
+    const where = `after.entries[${i}]`;
+    if (!isMap(e)) { bad.push(`${where} is not an object`); return; }
+    if (e.index != null) {
+      const old = have[e.index];
+      if (!Number.isInteger(e.index) || !isMap(old) || seen.has(e.index)) { bad.push(`${where}.index ${JSON.stringify(e.index)} is not an existing exercise of this workout, or is named twice (it has ${have.length}, indices from 0)`); return; }
+      if (e.id != null && e.id !== old.id) { bad.push(`${where}.id "${e.id}" does not match the exercise at index ${e.index} ("${old.id}") — omit id when editing an existing exercise`); return; }
+      seen.add(e.index);
+      const kept = { ...old };
+      const item = { index: e.index };
+      if (e.sets !== undefined) {
+        const r = mergeSets(e.sets, list(old.sets), where, bad);
+        if (!r) return;
+        kept.sets = r.finished;
+        item.sets = r.patch;
+      }
+      if (e.note !== undefined) {
+        const n = e.note == null ? '' : String(e.note).trim().slice(0, NOTE_MAX);
+        item.note = n;
+        if (n) kept.note = n; else { delete kept.note; delete kept.notePin; }
+      }
+      finished.push(kept); patch.push(item);
+    } else {
+      if (!isStr(e.id) || !exerciseKnown(S, e.id, ctx)) { bad.push(`${where}.id "${e.id}" is not in the exercise library or your own exercises`); return; }
+      const r = mergeSets(e.sets, null, where, bad);
+      if (!r) return;
+      const note = isStr(e.note) ? clamp(e.note.trim(), NOTE_MAX) : null;
+      finished.push({ id: e.id, sets: r.finished, target: null, ...(note ? { note } : {}) });
+      patch.push({ id: e.id, sets: r.patch, ...(note ? { note } : {}) });
+    }
+  });
+  return { finished, patch };
 }
 
 /** What the person did with an exercise, in one short line: "3 sets: 60x8, 60x8, 60x7". */
@@ -259,15 +312,17 @@ const V = {
       const where = `after.entries[${i}]`;
       if (!isMap(e) || !isStr(e.id)) { bad.push(`${where}.id is required`); return; }
       if (!exerciseKnown(S, e.id, ctx)) { bad.push(`${where}.id "${e.id}" is not in the exercise library or your own exercises — find one with search_exercises`); return; }
-      const sets = mergeSets(e.sets, null, where, bad);
-      if (!sets) return;
-      entries.push({ id: e.id, ...(isStr(e.note) ? { note: clamp(e.note.trim(), NOTE_MAX) } : {}), sets });
+      const r = mergeSets(e.sets, null, where, bad);
+      if (!r) return;
+      entries.push({ id: e.id, ...(isStr(e.note) ? { note: clamp(e.note.trim(), NOTE_MAX) } : {}), sets: r.finished });
     });
     if (!Array.isArray(a.entries) || !a.entries.length) bad.push('after.entries must list at least one exercise');
     if (bad.length) { errors.push(...bad); return { handled: true }; }
     if (!entries.some(e => e.sets.some(s => s.done && !isWarmupSet(s)))) return { error: 'a logged workout needs at least one completed working set' };
     // The id is minted here, so the card, the server's record and the client's apply agree on it.
-    const id = ctx.newId ? ctx.newId() : 'w' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    // One that is already there (a proposal validated again on the client) is kept.
+    const id = typeof a.id === 'string' && /^[A-Za-z0-9_-]{6,40}$/.test(a.id) && !findWorkout(S, a.id) ? a.id
+      : ctx.newId ? ctx.newId() : 'w' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
     const after = {
       id, d: a.d,
       name: isStr(a.name) ? clamp(a.name.trim(), NAME_MAX) : (a.routineId ? list(S.routines).find(r => r.id === a.routineId)?.name || 'Workout' : 'Workout'),
@@ -304,50 +359,26 @@ const V = {
       if (n.length > NOTE_MAX) bad.push(`after.note is longer than ${NOTE_MAX} characters`);
       else if (n !== (w.note || '').trim()) out.note = n;   // '' clears
     }
+    let finishedEntries = null;
     if (a.entries !== undefined) {
       if (!Array.isArray(a.entries) || !a.entries.length) bad.push('after.entries must list the exercises that remain (to remove the whole workout use workout-delete)');
       else {
-        const have = list(w.entries);
-        const seen = new Set();
-        const next = [];
-        a.entries.slice(0, 30).forEach((e, i) => {
-          const where = `after.entries[${i}]`;
-          if (!isMap(e)) { bad.push(`${where} is not an object`); return; }
-          if (e.index != null) {
-            const old = have[e.index];
-            if (!Number.isInteger(e.index) || !isMap(old) || seen.has(e.index)) { bad.push(`${where}.index ${JSON.stringify(e.index)} is not an existing exercise of this workout, or is named twice (it has ${have.length}, indices from 0)`); return; }
-            if (e.id != null && e.id !== old.id) { bad.push(`${where}.id "${e.id}" does not match the exercise at index ${e.index} ("${old.id}") — omit id when editing an existing exercise`); return; }
-            seen.add(e.index);
-            const kept = { ...old };
-            if (e.sets !== undefined) {
-              const sets = mergeSets(e.sets, list(old.sets), where, bad);
-              if (!sets) return;
-              kept.sets = sets;
-            }
-            if (e.note !== undefined) { const n = e.note == null ? '' : String(e.note).trim().slice(0, NOTE_MAX); if (n) kept.note = n; else { delete kept.note; delete kept.notePin; } }
-            next.push(kept);
-          } else {
-            if (!isStr(e.id) || !exerciseKnown(S, e.id, ctx)) { bad.push(`${where}.id "${e.id}" is not in the exercise library or your own exercises`); return; }
-            const sets = mergeSets(e.sets, null, where, bad);
-            if (!sets) return;
-            next.push({ id: e.id, sets, target: null, ...(isStr(e.note) ? { note: clamp(e.note.trim(), NOTE_MAX) } : {}) });
-          }
-        });
+        const built = buildEntries(S, w, a.entries, ctx, bad);
         if (!bad.length) {
-          if (!next.some(e => list(e.sets).some(s => s.done && !isWarmupSet(s)))) bad.push('the edited workout would have no completed working set — use workout-delete to remove it');
-          else if (!same(next, have)) out.entries = next;
+          if (!built.finished.some(e => list(e.sets).some(s => s.done && !isWarmupSet(s)))) bad.push('the edited workout would have no completed working set — use workout-delete to remove it');
+          else if (!same(built.finished, list(w.entries))) { out.entries = built.patch; finishedEntries = built.finished; }
         }
       }
     }
     if (bad.length) { errors.push(...bad); return { handled: true }; }
     if (!Object.keys(out).length) return { skip: `workout ${id} already reads that way` };
-    // `after` stored for the client is the whole patch with the finished entries, so applying
-    // needs nothing but this change and the live workout.
+    // What is stored is the cleaned patch, not the finished entries: applying works from the live
+    // workout (its `before` hash says it has not moved), and validating again gives this answer.
     const lines = [];
     if (out.d) lines.push({ k: 'date', before: w.d, after: out.d });
     if (out.name) lines.push({ k: 'name', before: w.name || '', after: out.name });
     if (out.note !== undefined) lines.push({ k: 'note', before: w.note || '', after: out.note || '(cleared)' });
-    if (out.entries) lines.push({ k: 'exercises', before: workoutLines(S, w).join('\n'), after: workoutLines(S, { entries: out.entries }).join('\n') });
+    if (out.entries) lines.push({ k: 'exercises', before: workoutLines(S, w).join('\n'), after: workoutLines(S, { entries: finishedEntries }).join('\n') });
     return { change: { type: 'workout-edit', target: { workoutId: String(w.id) }, before: workoutHash(w), after: out, lines, workoutName: w.name || null, workoutDate: w.d } };
   },
 
@@ -574,7 +605,8 @@ export function validateChangeSet(S, input, ctx = {}) {
   if (errors.length) return { ok: false, errors };
 
   const changes = results.filter(Boolean);
-  if (!changes.length) return { ok: false, errors: ['nothing to change — every change already matches the current state (' + skipped.join('; ') + '). Answer in text instead.'] };
+  // `unchanged` tells a client that checks a proposal again that it was not wrong, just already done.
+  if (!changes.length) return { ok: false, unchanged: true, errors: ['nothing to change — every change already matches the current state (' + skipped.join('; ') + '). Answer in text instead.'] };
 
   // Company: each change is fine alone; together they must still make sense.
   const seen = new Map();
@@ -678,7 +710,10 @@ export function applyDataChange(S, c, ctx = {}) {
       if (a.name) next.name = a.name;
       if (a.note !== undefined) { if (a.note) next.note = a.note; else delete next.note; }
       if (a.entries) {
-        next.entries = structuredClone(a.entries).map(e => ({ ...e, topW: topWeight(e.sets) }));
+        const bad = [];
+        const built = buildEntries(S, w, a.entries, {}, bad);
+        if (bad.length) throw new Error(bad[0]);
+        next.entries = structuredClone(built.finished).map(e => ({ ...e, topW: topWeight(e.sets) }));
         next.vol = Math.round(volumeOf(next.entries));
       }
       S.workouts[i] = next;
