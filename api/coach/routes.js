@@ -16,7 +16,11 @@ import { validateBaseUrl, validateHeaders, baseUrlFor } from './core/providers.j
 // them — it goes to the admin card, which is where someone can act on it (FR-47).
 const USER_ERROR = {
   off: 'the Coach is not set up on this instance',
-  busy: 'the Coach is already thinking about your training',
+  busy: 'the assistant is already answering you',
+  // The configured provider cannot run the assistant's tool loop. The Coach screen says which
+  // provider it needs; these words are for a client that has no line of its own for the class.
+  tools: 'the assistant needs the Claude provider (or the Anthropic API) on this instance',
+  empty: 'write a message first',
   cap: 'the Coach is taking a rest day, try again tomorrow',
   consent: 'the Coach needs your go-ahead first',
   // Verbatim, because it tells the user the one thing that resolves it and names who resolves
@@ -27,7 +31,7 @@ const USER_ERROR = {
   account: cfgStore.NO_PROFILE_ACCOUNT_REFUSAL,
   unprivileged: 'the Coach is switched off on this instance for safety reasons'
 };
-const HTTP_FOR = { off: 503, busy: 409, cap: 429, consent: 403, shared: 409, account: 409, unprivileged: 503 };
+const HTTP_FOR = { off: 503, busy: 409, tools: 409, empty: 400, cap: 429, consent: 403, shared: 409, account: 409, unprivileged: 503 };
 
 /* No key or setup token contains whitespace. Removing all of it, not just the ends, saves a
    `claude setup-token` paste that brought the terminal's line wrap along: with the break
@@ -63,7 +67,10 @@ export function coachRoutes({ json, readBody, readSession, requireAdmin }) {
         provider: cfg.provider,
         providerLabel: cfgStore.providerMeta(cfg).label,
         categories: DATA_CATEGORIES,
-        version: 1
+        // What leaves is whatever the assistant looks up to answer, one tool call at a time,
+        // for the profile that asked and nobody else's. The screen says so in these words.
+        flow: 'tools',
+        version: 2
       });
     },
 
@@ -74,43 +81,25 @@ export function coachRoutes({ json, readBody, readSession, requireAdmin }) {
       json(res, 200, { ...jobs.status(user.id), maxMessageLen: cfgStore.load().maxMessageLen });
     },
 
-    'POST /api/coach/plan': async (req, res) => {
+    // The conversation, oldest first. The status poll says when it has changed (`chatRev`).
+    'GET /api/coach/chat': async (req, res) => {
+      const user = guard(req, res); if (!user) return;
+      json(res, 200, { chat: jobs.readChat(user.id), chatRev: jobs.status(user.id).chatRev });
+    },
+
+    // One message, one job. The answer arrives in the thread; the client polls status for it.
+    'POST /api/coach/message': async (req, res) => {
       const user = guard(req, res); if (!user) return;
       const body = await readBody(req);
       try {
         // The admin's configured length is the real limit; jobs.enqueue is where it is actually
         // enforced (it is the one place that already loads config for every job). This slice is
         // only a sanity ceiling so an oversized string is not carried further than it has to be.
-        const job = jobs.enqueue(user.id, {
-          kind: 'create',
-          intake: body.intake || null,
-          lang: body.lang,
-          refine: body.refine ? String(body.refine).slice(0, cfgStore.MAX_MESSAGE_LEN_CEILING) : null
+        const r = jobs.enqueue(user.id, {
+          text: typeof body.text === 'string' ? body.text.slice(0, cfgStore.MAX_MESSAGE_LEN_CEILING) : '',
+          lang: body.lang
         });
-        json(res, 202, { job });
-      } catch (e) { failEnqueue(res, e); }
-    },
-
-    'POST /api/coach/review': async (req, res) => {
-      const user = guard(req, res); if (!user) return;
-      const body = await readBody(req);
-      try {
-        const job = jobs.enqueue(user.id, {
-          kind: 'review',
-          lang: body.lang,
-          note: body.note ? String(body.note).slice(0, cfgStore.MAX_MESSAGE_LEN_CEILING) : null
-        });
-        json(res, 202, { job });
-      } catch (e) { failEnqueue(res, e); }
-    },
-
-    // One workout, read closely. Nothing to apply — the card is kept in the user's log.
-    'POST /api/coach/debrief': async (req, res) => {
-      const user = guard(req, res); if (!user) return;
-      const body = await readBody(req);
-      try {
-        const job = jobs.enqueue(user.id, { kind: 'debrief', lang: body.lang, workoutId: body.workoutId ? String(body.workoutId).slice(0, 40) : null });
-        json(res, 202, { job });
+        json(res, 202, { job: { id: r.id }, message: r.message });
       } catch (e) { failEnqueue(res, e); }
     },
 
@@ -127,14 +116,16 @@ export function coachRoutes({ json, readBody, readSession, requireAdmin }) {
       json(res, 200, { ok: true, sharing: jobs.setShare(user.id, !!body.share) });
     },
 
-    'POST /api/coach/pending/resolve': async (req, res) => {
+    // The person applied, dismissed or undid a proposal. The change itself happened (or did not)
+    // on their device; this records it, so the next message can say what became of the last one.
+    'POST /api/coach/proposal/resolve': async (req, res) => {
       const user = guard(req, res); if (!user) return;
       const body = await readBody(req);
-      json(res, 200, jobs.resolvePending(user.id, {
-        accepted: Array.isArray(body.accepted) ? body.accepted : [],
-        rejected: Array.isArray(body.rejected) ? body.rejected : [],
-        dismissed: !!body.dismissed
-      }));
+      const status = String(body.status || '');
+      if (!['applied', 'dismissed', 'undone'].includes(status)) return json(res, 400, { error: 'status must be applied, dismissed or undone' });
+      const r = jobs.resolveProposal(user.id, String(body.id || '').slice(0, 40), status);
+      if (!r.ok) return json(res, r.code === 'unknown' ? 404 : 409, { error: r.code === 'unknown' ? 'no such proposal' : `the proposal is already ${r.status}`, code: r.code });
+      json(res, 200, r);
     },
 
     // Consent withdrawn, or the profile turned the Coach off: drop everything held server-side
@@ -250,6 +241,8 @@ export function coachRoutes({ json, readBody, readSession, requireAdmin }) {
         jobsToday: cfg.daily?.date === today ? cfg.daily.count : 0,
         lastSuccess: cfgStore.lastSuccess(),
         lastError: cfgStore.lastError(),
+        // Whether the configured provider can run the assistant (a tool loop) at all.
+        assistant: !!adapter?.tools,
         recent: log.slice(-20).reverse().map(e => ({ at: e.at, kind: e.kind, trigger: e.trigger, outcome: e.outcome, errorClass: e.errorClass, ms: e.ms }))
       });
     },

@@ -7,10 +7,11 @@
  * What is computed is deliberately coarse: a median across at least MIN_PEOPLE participants
  * per number, never a single person's value, never a body weight, never a date. With three
  * people the median is still one person's number, so the floor is a floor on *plausibility*
- * of guessing whose, not a cryptographic guarantee; the docs say so.
+ * of guessing whose, not a cryptographic guarantee; the docs say so. The assistant is not given
+ * these numbers: they only ever reach the person's own screen.
  *
- * Everything is read from the state files on disk — the same ones the Coach reads for a
- * review — and cached for a few minutes, because a box with forty profiles should not parse
+ * Everything is read from the state files on disk — the same ones the assistant's tools read for
+ * one profile — and cached for a few minutes, because a box with forty profiles should not parse
  * forty JSON blobs on every open of the sheet.
  */
 import * as cfgStore from './config.js';
@@ -124,29 +125,4 @@ export function computeCohort(uid) {
     exercises: exercises.map(x => ({ id: x.id, name: x.name, people: x.people, median: out(x.medianKg), you: out(x.youKg) })),
     rankPct
   };
-}
-
-/** The compact form a prompt gets — kg regardless of the requester's unit, or null. */
-export function cohortForPayload(uid) {
-  try {
-    if (!cfgStore.load().community || !isSharing(uid)) return null;
-    const all = rows();
-    if (all.size < MIN_PEOPLE) return null;
-    const me = all.get(uid) || null;
-    const byEx = new Map();
-    for (const p of all.values()) for (const [id, est] of Object.entries(p.best)) {
-      if (!byEx.has(id)) byEx.set(id, []);
-      byEx.get(id).push(est);
-    }
-    const exercises = [...byEx.entries()]
-      .filter(([, list]) => list.length >= MIN_PEOPLE)
-      .map(([id, list]) => ({ id, name: libraryName(id), median: round1(median(list)), you: me?.best[id] != null ? round1(me.best[id]) : null }))
-      .sort((a, b) => (b.you != null) - (a.you != null) || a.name.localeCompare(b.name))
-      .slice(0, MAX_EXERCISES);
-    return {
-      unit: 'kg', people: all.size,
-      sessionsPerWeek: { median: median([...all.values()].map(p => p.sessionsPerWeek)), you: me?.sessionsPerWeek ?? 0 },
-      exercises
-    };
-  } catch { return null; }
 }

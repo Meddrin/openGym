@@ -33,8 +33,7 @@ const server = http.createServer((req, res) => {
     seen.push({ url: req.url, key: req.headers['x-api-key'] || null });
     const send = (status, obj) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
     if (req.method === 'GET' && req.url.startsWith('/v1/models')) return send(200, { data: [{ id: 'model-a' }] });
-    const text = req.url === '/v1/messages' && /ok\\*":true/.test(body) ? '{"coach_contract":1,"ok":true}'
-      : JSON.stringify({ coach_contract: 1, nochange: true, reading: 'Nothing to change yet.' });
+    const text = 'Nothing to change yet.';
     if (req.url === '/v1/messages') return send(200, { content: [{ type: 'text', text }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } });
     send(404, { error: { message: 'unknown route ' + req.url } });
   });
@@ -98,8 +97,8 @@ test('profile mode: A connects its own setup token, A gets it, B is refused and 
   assert.equal(b.reason, 'no-credential');
   assert.equal(b.auth, undefined);
   assert.match(b.message, /Connect yours in the Coach settings/);
-  assert.throws(() => jobs.enqueue('bob', { kind: 'review' }), e => e.code === 'account' && /Coach settings/.test(e.message));
-  r = await as('bob', 'POST /api/coach/review', {});
+  assert.throws(() => jobs.enqueue('bob', { text: 'hi' }), e => e.code === 'account' && /Coach settings/.test(e.message));
+  r = await as('bob', 'POST /api/coach/message', { text: 'hi' });
   assert.equal(r.status, 409);
   assert.equal(r.body.code, 'account');
   assert.match(r.body.error, /Connect yours in the Coach settings/);
@@ -127,13 +126,13 @@ test('profile mode: A and B each connect a key and each job is sent on its own',
   assert.equal(cfg.jobEnv('/tmp/j', cfg.credentialFor('alice')).ANTHROPIC_API_KEY, KEY_A);
   assert.equal(cfg.jobEnv('/tmp/j', cfg.credentialFor('bob')).ANTHROPIC_API_KEY, KEY_B);
 
-  jobs.enqueue('alice', { kind: 'review' });
+  jobs.enqueue('alice', { text: 'hi' });
   await settle('alice');
-  jobs.enqueue('bob', { kind: 'review' });
+  jobs.enqueue('bob', { text: 'hi' });
   await settle('bob');
   assert.deepEqual(messageKeys(), [KEY_A, KEY_B], 'each request carried the key of the profile that asked');
-  assert.equal(jobs.readUser('alice').history.at(-1).outcome, 'nochange');
-  assert.equal(jobs.readUser('bob').history.at(-1).outcome, 'nochange');
+  assert.equal(jobs.readUser('alice').history.at(-1).outcome, 'ready');
+  assert.equal(jobs.readUser('bob').history.at(-1).outcome, 'ready');
 
   // Each credential is its own 0600-class file next to, not inside, the synced state.
   assert.ok(fs.existsSync(cfg.profileAuthFile('alice')) && fs.existsSync(cfg.profileAuthFile('bob')));
@@ -144,9 +143,9 @@ test('profile mode: A and B each connect a key and each job is sent on its own',
 test('profile mode: the daily cap still applies per profile', async () => {
   fresh('anthropic', 'profile', { caps: { perProfileDaily: 1, instanceDaily: 0 } });
   await as('alice', 'POST /api/coach/credential', { type: 'apikey', token: KEY_A });
-  jobs.enqueue('alice', { kind: 'review' });
+  jobs.enqueue('alice', { text: 'hi' });
   await settle('alice');
-  assert.throws(() => jobs.enqueue('alice', { kind: 'review' }), e => e.code === 'cap');
+  assert.throws(() => jobs.enqueue('alice', { text: 'hi' }), e => e.code === 'cap');
 });
 
 test('a credential filed for one provider is not sent to another after the admin switches', async () => {
@@ -276,7 +275,7 @@ test('disconnect removes only the caller\'s own credential', async () => {
   assert.deepEqual(r.body, { ok: true });
   assert.equal(cfg.credentialFor('alice').ok, false);
   assert.equal(cfg.credentialFor('bob').auth.token, KEY_B);
-  assert.throws(() => jobs.enqueue('alice', { kind: 'review' }), e => e.code === 'account');
+  assert.throws(() => jobs.enqueue('alice', { text: 'hi' }), e => e.code === 'account');
 });
 
 /* ---------- 5: "Test my connection" uses the caller's own credential ---------- */

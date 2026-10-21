@@ -245,7 +245,7 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
   <p class="api-facts">
     <span>OpenAPI 3.1.0</span>
     <span>openGym v1.4.1</span>
-    <span>73 endpoints</span>
+    <span>72 endpoints</span>
     <span>AGPL-3.0-or-later</span>
   </p>
 
@@ -2067,7 +2067,7 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
 
 <section class="api-sec" id="coach">
   <h2>AI Coach</h2>
-  <p class="sub">AI Coach: plans, reviews and debriefs. Every route here answers 503 unless the instance has the Coach switched on and a provider connected.</p>
+  <p class="sub">AI Coach: a chat assistant that looks things up in your own data and proposes edits. Every route here answers 503 unless the instance has the Coach switched on and a provider connected.</p>
   <div class="eps">
 
 <details class="ep" id="op-getCoachDisclosure">
@@ -2078,7 +2078,8 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
     <span class="ep-sum">What the consent screen must say</span>
   </summary>
   <div class="ep-body">
-<p>The categories of data a Coach job would send, and the provider it would go to, read straight from the module that builds the payload, so the consent screen cannot drift from what actually leaves the box.</p>
+<p>The categories of data the assistant can reach, and the provider it talks to, read straight from the module that defines them, so the consent screen cannot drift from what can actually leave the box.</p>
+<p>Nothing is sent up front. The assistant asks for what a question needs one tool call at a time, each bound to the profile that asked, and <code>flow: tools</code> says so.</p>
 <p>Needs a session but <i>not</i> a connected Coach: the screen that collects consent runs before there is anything to consent to.</p>
     <p class="ep-auth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2.5"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Requires a session: the cookie set at sign-in, or <code>Authorization: Bearer &lt;token&gt;</code> from mobile-app pairing.</span></p>
 
@@ -2087,7 +2088,7 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
     <div class="ptab">
   <div class="prow rrow">
     <span class="r-code s2">200</span>
-    <span class="p-desc">The disclosure.<span class="r-sig">{ provider: string, providerLabel: string, categories: (&quot;plan&quot; | &quot;training&quot; | &quot;bodyweight&quot; | &quot;profile&quot; | &quot;prefs&quot;)[], version: integer }</span></span>
+    <span class="p-desc">The disclosure.<span class="r-sig">{ provider: string, providerLabel: string, categories: (&quot;plan&quot; | &quot;training&quot; | &quot;bodyweight&quot; | &quot;profile&quot; | &quot;prefs&quot; | &quot;chat&quot;)[], flow: &quot;tools&quot;, version: integer }</span></span>
   </div>
   <div class="prow rrow">
     <span class="r-code s4">401</span>
@@ -2102,10 +2103,10 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
     <span class="m get">GET</span>
     <span class="ep-path"><code>/api/coach/status</code></span>
     <span class="ep-chev" aria-hidden="true"></span>
-    <span class="ep-sum">The running job, the waiting proposal and today's budget</span>
+    <span class="ep-sum">The running job, today's budget and whether the thread changed</span>
   </summary>
   <div class="ep-body">
-<p>What the Coach screen polls. Also the only place a proposal past its 14-day expiry is retired. A phone that stays closed never polls, so nothing else would notice.</p>
+<p>What the Coach screen polls. <code>chatRev</code> changes whenever the thread does (a reply, a decision recorded from another device), so the client reads the thread only when it has something new.</p>
     <p class="ep-auth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2.5"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Requires a session: the cookie set at sign-in, or <code>Authorization: Bearer &lt;token&gt;</code> from mobile-app pairing.</span></p>
 
 
@@ -2127,50 +2128,73 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
   </div>
 </details>
 
-<details class="ep" id="op-postCoachPlan">
+<details class="ep" id="op-getCoachChat">
   <summary>
-    <span class="m post">POST</span>
-    <span class="ep-path"><code>/api/coach/plan</code></span>
+    <span class="m get">GET</span>
+    <span class="ep-path"><code>/api/coach/chat</code></span>
     <span class="ep-chev" aria-hidden="true"></span>
-    <span class="ep-sum">Ask for a training plan</span>
+    <span class="ep-sum">The conversation</span>
   </summary>
   <div class="ep-body">
-<p>Queues a <code>create</code> job. With <code>intake</code> it builds a plan from the answers given on the intake screen; with <code>refine</code> it reworks the proposal already waiting, in the words of the person reading it. The answer is 202 and a job id; the result arrives through <code>GET /api/coach/status</code>.</p>
+<p>The thread with the assistant, oldest first, at most 60 messages. It lives on the server in the profile's own Coach record, not in the synced state, so every device reads the same one and a stale device cannot overwrite it. A proposal nobody answered for 14 days reads <code>expired</code>; only the newest few proposals carry their <code>changes</code>, older ones keep their summary, a <code>count</code> and what became of them.</p>
     <p class="ep-auth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2.5"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Requires a session: the cookie set at sign-in, or <code>Authorization: Bearer &lt;token&gt;</code> from mobile-app pairing.</span></p>
 
-<p class="ep-h">Request body <span class="p-hint">(JSON)</span> <span class="p-hint">(optional)</span></p><div class="ptab">
-  <div class="prow">
-    <span class="p-name">intake</span>
-    <span class="p-type"><a href="#schema-CoachIntake">CoachIntake</a></span>
-    <span class="p-desc"></span>
+
+    <p class="ep-h">Responses</p>
+    <div class="ptab">
+  <div class="prow rrow">
+    <span class="r-code s2">200</span>
+    <span class="p-desc">The thread.<span class="r-sig">{ chat: <a href="#schema-CoachMessage">CoachMessage</a>[], chatRev: integer }</span></span>
   </div>
+  <div class="prow rrow">
+    <span class="r-code s4">401</span>
+    <span class="p-desc">No session, expired/revoked session, or a disabled account.<span class="r-sig"><code>{&quot;error&quot;:&quot;not signed in&quot;}</code></span></span>
+  </div>
+  <div class="prow rrow">
+    <span class="r-code s5">503</span>
+    <span class="p-desc">The Coach is not set up on this instance (switched off, or no provider connected). Every Coach route answers this rather than pretending, so an unconfigured instance renders exactly the app it was before the feature existed. <code>code</code> is <code>off</code>, the class a job refused at enqueue for the same reason carries; the app shows its own line for it.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is not set up on this instance&quot;}</code></span></span>
+  </div>
+    </div>
+  </div>
+</details>
+
+<details class="ep" id="op-postCoachMessage">
+  <summary>
+    <span class="m post">POST</span>
+    <span class="ep-path"><code>/api/coach/message</code></span>
+    <span class="ep-chev" aria-hidden="true"></span>
+    <span class="ep-sum">Say something to the assistant</span>
+  </summary>
+  <div class="ep-body">
+<p>One message is one job. The user's line joins the thread at once; the answer (plain prose, and a proposal when it suggests edits) joins it when the job ends, and the status poll says when. The model gets the last twenty turns, each cut to 1500 characters, with what happened to any proposal in them.</p>
+<p>The assistant never edits anything: its <code>propose_changes</code> tool records a proposal that the client applies as ordinary local edits after a tap. It needs a provider that can run a tool loop; with another one the answer is 409 <code>tools</code>.</p>
+    <p class="ep-auth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2.5"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Requires a session: the cookie set at sign-in, or <code>Authorization: Bearer &lt;token&gt;</code> from mobile-app pairing.</span></p>
+
+<p class="ep-h">Request body <span class="p-hint">(JSON)</span></p><div class="ptab">
   <div class="prow">
-    <span class="p-name">refine</span>
+    <span class="p-name">text<em class="p-req" title="required">required</em></span>
     <span class="p-type">string <span class="p-hint">(&le; 4000 chars)</span></span>
-    <span class="p-desc">A change asked for in plain words, applied to the proposal now waiting. Cut to the instance's <code>maxMessageLen</code> (1000 unless the admin changed it; 200–4000).</span>
+    <span class="p-desc">The message. Cut to the instance's <code>maxMessageLen</code> (1000 unless the admin changed it; 200-4000). Empty is refused.</span>
   </div>
   <div class="prow">
     <span class="p-name">lang</span>
     <span class="p-type">string</span>
-    <span class="p-desc">The language the app is showing, which the Coach writes in. Absent or not a language tag, the profile's stored <code>lang</code> is used.</span>
+    <span class="p-desc">The language the app is showing, which the assistant answers in unless the message is written in another. Absent or not a language tag, the profile's stored <code>lang</code> is used.</span>
   </div>
 </div>
 <pre><code>{
-  &quot;intake&quot;: {
-    &quot;goal&quot;: &quot;muscle&quot;,
-    &quot;experience&quot;: &quot;novice&quot;,
-    &quot;daysPerWeek&quot;: 3,
-    &quot;equipment&quot;: [
-      &quot;dumbbell&quot;,
-      &quot;barbell&quot;
-    ]
-  }
+  &quot;text&quot;: &quot;Log my weight, 79.4 kg this morning.&quot;,
+  &quot;lang&quot;: &quot;en&quot;
 }</code></pre>
     <p class="ep-h">Responses</p>
     <div class="ptab">
   <div class="prow rrow">
     <span class="r-code s2">202</span>
-    <span class="p-desc">Queued. The job runs in the background; its outcome arrives through <code>GET /api/coach/status</code>, which the client polls.<span class="r-sig">{ job: object }</span></span>
+    <span class="p-desc">Queued. The answer arrives in the thread.<span class="r-sig">{ job: object, message: <a href="#schema-CoachMessage">CoachMessage</a> }</span></span>
+  </div>
+  <div class="prow rrow">
+    <span class="r-code s4">400</span>
+    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>tools</code> (409): the configured provider cannot run the assistant (it needs the Claude provider or the Anthropic API). - <code>empty</code> (400): the message was empty. - <code>account</code> (409): per-profile mode, and this profile has not connected its own account. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the assistant is already answering you&quot;}</code></span></span>
   </div>
   <div class="prow rrow">
     <span class="r-code s4">401</span>
@@ -2178,15 +2202,15 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
   </div>
   <div class="prow rrow">
     <span class="r-code s4">403</span>
-    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is already thinking about your training&quot;}</code></span></span>
+    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>tools</code> (409): the configured provider cannot run the assistant (it needs the Claude provider or the Anthropic API). - <code>empty</code> (400): the message was empty. - <code>account</code> (409): per-profile mode, and this profile has not connected its own account. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the assistant is already answering you&quot;}</code></span></span>
   </div>
   <div class="prow rrow">
     <span class="r-code s4">409</span>
-    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is already thinking about your training&quot;}</code></span></span>
+    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>tools</code> (409): the configured provider cannot run the assistant (it needs the Claude provider or the Anthropic API). - <code>empty</code> (400): the message was empty. - <code>account</code> (409): per-profile mode, and this profile has not connected its own account. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the assistant is already answering you&quot;}</code></span></span>
   </div>
   <div class="prow rrow">
     <span class="r-code s4">429</span>
-    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is already thinking about your training&quot;}</code></span></span>
+    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>tools</code> (409): the configured provider cannot run the assistant (it needs the Claude provider or the Anthropic API). - <code>empty</code> (400): the message was empty. - <code>account</code> (409): per-profile mode, and this profile has not connected its own account. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the assistant is already answering you&quot;}</code></span></span>
   </div>
   <div class="prow rrow">
     <span class="r-code s5">503</span>
@@ -2196,149 +2220,50 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
   </div>
 </details>
 
-<details class="ep" id="op-postCoachReview">
+<details class="ep" id="op-postCoachProposalResolve">
   <summary>
     <span class="m post">POST</span>
-    <span class="ep-path"><code>/api/coach/review</code></span>
+    <span class="ep-path"><code>/api/coach/proposal/resolve</code></span>
     <span class="ep-chev" aria-hidden="true"></span>
-    <span class="ep-sum">Ask for a review of the training since the last one</span>
+    <span class="ep-sum">Record what the person did with a proposal</span>
   </summary>
   <div class="ep-body">
-<p>Queues a <code>review</code> job, the same job the weekly cadence queues on its own. The answer is either a change-set to accept or reject, or &quot;nothing to change&quot; with the reason, both delivered through <code>GET /api/coach/status</code>.</p>
+<p>The client applies a proposal's changes to its own state and syncs them through <code>PUT /api/data</code>; this only records the decision on the thread, so the next message can say what became of it. Statuses move forward only: <code>pending</code> to <code>applied</code> or <code>dismissed</code>, and <code>applied</code> to <code>undone</code>.</p>
     <p class="ep-auth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2.5"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Requires a session: the cookie set at sign-in, or <code>Authorization: Bearer &lt;token&gt;</code> from mobile-app pairing.</span></p>
 
-<p class="ep-h">Request body <span class="p-hint">(JSON)</span> <span class="p-hint">(optional)</span></p><div class="ptab">
+<p class="ep-h">Request body <span class="p-hint">(JSON)</span></p><div class="ptab">
   <div class="prow">
-    <span class="p-name">note</span>
-    <span class="p-type">string <span class="p-hint">(&le; 4000 chars)</span></span>
-    <span class="p-desc">Anything the profile wants the Coach to know this time round. Cut to the instance's <code>maxMessageLen</code> (1000 unless the admin changed it; 200–4000).</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">lang</span>
+    <span class="p-name">id<em class="p-req" title="required">required</em></span>
     <span class="p-type">string</span>
-    <span class="p-desc">The language the app is showing, which the Coach writes in. Absent or not a language tag, the profile's stored <code>lang</code> is used.</span>
-  </div>
-</div>
-    <p class="ep-h">Responses</p>
-    <div class="ptab">
-  <div class="prow rrow">
-    <span class="r-code s2">202</span>
-    <span class="p-desc">Queued. The job runs in the background; its outcome arrives through <code>GET /api/coach/status</code>, which the client polls.<span class="r-sig">{ job: object }</span></span>
-  </div>
-  <div class="prow rrow">
-    <span class="r-code s4">401</span>
-    <span class="p-desc">No session, expired/revoked session, or a disabled account.<span class="r-sig"><code>{&quot;error&quot;:&quot;not signed in&quot;}</code></span></span>
-  </div>
-  <div class="prow rrow">
-    <span class="r-code s4">403</span>
-    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is already thinking about your training&quot;}</code></span></span>
-  </div>
-  <div class="prow rrow">
-    <span class="r-code s4">409</span>
-    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is already thinking about your training&quot;}</code></span></span>
-  </div>
-  <div class="prow rrow">
-    <span class="r-code s4">429</span>
-    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is already thinking about your training&quot;}</code></span></span>
-  </div>
-  <div class="prow rrow">
-    <span class="r-code s5">503</span>
-    <span class="p-desc">The Coach is not set up on this instance (switched off, or no provider connected). Every Coach route answers this rather than pretending, so an unconfigured instance renders exactly the app it was before the feature existed. <code>code</code> is <code>off</code>, the class a job refused at enqueue for the same reason carries; the app shows its own line for it.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is not set up on this instance&quot;}</code></span></span>
-  </div>
-    </div>
-  </div>
-</details>
-
-<details class="ep" id="op-postCoachDebrief">
-  <summary>
-    <span class="m post">POST</span>
-    <span class="ep-path"><code>/api/coach/debrief</code></span>
-    <span class="ep-chev" aria-hidden="true"></span>
-    <span class="ep-sum">Ask for a read of one session</span>
-  </summary>
-  <div class="ep-body">
-<p>Queues a <code>debrief</code> job: one workout, read closely. It changes nothing; the card it produces is kept in the profile's log. With no <code>workoutId</code> the most recent session is read.</p>
-    <p class="ep-auth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2.5"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Requires a session: the cookie set at sign-in, or <code>Authorization: Bearer &lt;token&gt;</code> from mobile-app pairing.</span></p>
-
-<p class="ep-h">Request body <span class="p-hint">(JSON)</span> <span class="p-hint">(optional)</span></p><div class="ptab">
-  <div class="prow">
-    <span class="p-name">workoutId</span>
-    <span class="p-type">string <span class="p-hint">(&le; 40 chars)</span> | null</span>
-    <span class="p-desc">The workout to read; null or absent means the latest.</span>
+    <span class="p-desc">The proposal's id</span>
   </div>
   <div class="prow">
-    <span class="p-name">lang</span>
-    <span class="p-type">string</span>
-    <span class="p-desc">The language the app is showing, which the Coach writes in. Absent or not a language tag, the profile's stored <code>lang</code> is used.</span>
-  </div>
-</div>
-    <p class="ep-h">Responses</p>
-    <div class="ptab">
-  <div class="prow rrow">
-    <span class="r-code s2">202</span>
-    <span class="p-desc">Queued. The job runs in the background; its outcome arrives through <code>GET /api/coach/status</code>, which the client polls.<span class="r-sig">{ job: object }</span></span>
-  </div>
-  <div class="prow rrow">
-    <span class="r-code s4">401</span>
-    <span class="p-desc">No session, expired/revoked session, or a disabled account.<span class="r-sig"><code>{&quot;error&quot;:&quot;not signed in&quot;}</code></span></span>
-  </div>
-  <div class="prow rrow">
-    <span class="r-code s4">403</span>
-    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is already thinking about your training&quot;}</code></span></span>
-  </div>
-  <div class="prow rrow">
-    <span class="r-code s4">409</span>
-    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is already thinking about your training&quot;}</code></span></span>
-  </div>
-  <div class="prow rrow">
-    <span class="r-code s4">429</span>
-    <span class="p-desc">The Coach will not take this job, and says which reason in <code>code</code>: - <code>busy</code> (409): a job for this profile is already running. - <code>shared</code> (409): instance mode, and the credential belongs to another profile. - <code>cap</code> (429): this profile's or the instance's daily limit is spent. - <code>consent</code> (403): no consent recorded for this profile. - <code>unprivileged</code> (503): the privilege drop cannot be performed, so no job runs. The message is the one to show; the raw provider detail never reaches the user.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is already thinking about your training&quot;}</code></span></span>
-  </div>
-  <div class="prow rrow">
-    <span class="r-code s5">503</span>
-    <span class="p-desc">The Coach is not set up on this instance (switched off, or no provider connected). Every Coach route answers this rather than pretending, so an unconfigured instance renders exactly the app it was before the feature existed. <code>code</code> is <code>off</code>, the class a job refused at enqueue for the same reason carries; the app shows its own line for it.<span class="r-sig"><code>{&quot;error&quot;:&quot;the Coach is not set up on this instance&quot;}</code></span></span>
-  </div>
-    </div>
-  </div>
-</details>
-
-<details class="ep" id="op-postCoachResolve">
-  <summary>
-    <span class="m post">POST</span>
-    <span class="ep-path"><code>/api/coach/pending/resolve</code></span>
-    <span class="ep-chev" aria-hidden="true"></span>
-    <span class="ep-sum">Apply or discard the waiting proposal</span>
-  </summary>
-  <div class="ep-body">
-<p>The client applies the accepted changes to its own state and syncs them through <code>PUT /api/data</code>; this only records the decision and clears the proposal. Sending it when nothing is waiting is a no-op, not an error.</p>
-    <p class="ep-auth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2.5"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Requires a session: the cookie set at sign-in, or <code>Authorization: Bearer &lt;token&gt;</code> from mobile-app pairing.</span></p>
-
-<p class="ep-h">Request body <span class="p-hint">(JSON)</span> <span class="p-hint">(optional)</span></p><div class="ptab">
-  <div class="prow">
-    <span class="p-name">accepted</span>
-    <span class="p-type">string[]</span>
-    <span class="p-desc">Ids of the changes the person kept.</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">rejected</span>
-    <span class="p-type">string[]</span>
-    <span class="p-desc">Ids of the changes they turned down.</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">dismissed</span>
-    <span class="p-type">boolean</span>
-    <span class="p-desc">True when the whole proposal was thrown away unread.</span>
+    <span class="p-name">status<em class="p-req" title="required">required</em></span>
+    <span class="p-type">&quot;applied&quot; | &quot;dismissed&quot; | &quot;undone&quot;</span>
+    <span class="p-desc"></span>
   </div>
 </div>
     <p class="ep-h">Responses</p>
     <div class="ptab">
   <div class="prow rrow">
     <span class="r-code s2">200</span>
-    <span class="p-desc">Recorded; the proposal is cleared.<span class="r-sig"><a href="#schema-Ok">Ok</a></span></span>
+    <span class="p-desc">Recorded.<span class="r-sig">{ ok: always true, status: string }</span></span>
+  </div>
+  <div class="prow rrow">
+    <span class="r-code s4">400</span>
+    <span class="p-desc">Not one of the three statuses.</span>
   </div>
   <div class="prow rrow">
     <span class="r-code s4">401</span>
     <span class="p-desc">No session, expired/revoked session, or a disabled account.<span class="r-sig"><code>{&quot;error&quot;:&quot;not signed in&quot;}</code></span></span>
+  </div>
+  <div class="prow rrow">
+    <span class="r-code s4">404</span>
+    <span class="p-desc">No such proposal in this profile's thread.</span>
+  </div>
+  <div class="prow rrow">
+    <span class="r-code s4">409</span>
+    <span class="p-desc">The proposal is already past that state (applied, dismissed, expired).</span>
   </div>
   <div class="prow rrow">
     <span class="r-code s5">503</span>
@@ -3085,7 +3010,7 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
   <div class="prow">
     <span class="p-name">maxMessageLen</span>
     <span class="p-type">integer <span class="p-hint">(200&ndash;4000)</span></span>
-    <span class="p-desc">How long a chat message, refinement or review note can be. Clamped into the range; not a number keeps the current value.</span>
+    <span class="p-desc">How long a chat message can be. Clamped into the range; not a number keeps the current value.</span>
   </div>
 </div>
 <pre><code>{
@@ -4676,19 +4601,34 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
     <span class="p-desc">The job running now, or null. One at a time per profile.</span>
   </div>
   <div class="prow">
-    <span class="p-name">pending</span>
-    <span class="p-type"><a href="#schema-CoachProposal">CoachProposal</a> | null</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
     <span class="p-name">cap</span>
     <span class="p-type"><a href="#schema-CoachCap">CoachCap</a></span>
     <span class="p-desc"></span>
   </div>
   <div class="prow">
+    <span class="p-name">chatRev</span>
+    <span class="p-type">integer</span>
+    <span class="p-desc">Changes whenever the thread does; the client reads <code>GET /api/coach/chat</code> when it moves.</span>
+  </div>
+  <div class="prow">
+    <span class="p-name">assistant</span>
+    <span class="p-type">object</span>
+    <span class="p-desc">Whether the configured provider can run the assistant at all.</span>
+  </div>
+  <div class="prow">
+    <span class="p-name">assistant.supported</span>
+    <span class="p-type">boolean</span>
+    <span class="p-desc"></span>
+  </div>
+  <div class="prow">
+    <span class="p-name">assistant.provider</span>
+    <span class="p-type">string</span>
+    <span class="p-desc"></span>
+  </div>
+  <div class="prow">
     <span class="p-name">maxMessageLen</span>
     <span class="p-type">integer <span class="p-hint">(200&ndash;4000)</span></span>
-    <span class="p-desc">The longest note or refinement this instance keeps, in characters. It rides on the poll so a chat that is already open follows an admin's change.</span>
+    <span class="p-desc">The longest message this instance keeps, in characters. It rides on the poll so a chat that is already open follows an admin's change.</span>
   </div>
   <div class="prow">
     <span class="p-name">last</span>
@@ -4699,23 +4639,71 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
   </div>
 </details>
 
-<details class="ep sch" id="schema-CoachProposal">
+<details class="ep sch" id="schema-CoachMessage">
   <summary>
-    <span class="sch-name"><code>CoachProposal</code></span>
+    <span class="sch-name"><code>CoachMessage</code></span>
     <span class="ep-chev" aria-hidden="true"></span>
-    <span class="ep-sum">The answer waiting for a decision, from whichever kind of job produced it.</span>
+    <span class="ep-sum">One line of the thread.</span>
   </summary>
   <div class="ep-body">
-<p>It expires 14 days after it was made; the first status poll after that retires it. <code>changes</code> comes from a review, <code>bundle</code> from a plan, <code>score</code>/<code>highlights</code> from a debrief. One of the three, never more.</p>
+<p>A user message is <code>kind: text</code>. An assistant message is <code>text</code> (prose, markdown allowed, plus an optional <code>proposal</code>) or <code>error</code> (the job failed; <code>errorClass</code> says how, and the provider's own words never appear here).</p>
 <div class="ptab">
   <div class="prow">
     <span class="p-name">id</span>
     <span class="p-type">string</span>
-    <span class="p-desc">The job's id.</span>
+    <span class="p-desc"></span>
+  </div>
+  <div class="prow">
+    <span class="p-name">role</span>
+    <span class="p-type">&quot;user&quot; | &quot;assistant&quot;</span>
+    <span class="p-desc"></span>
   </div>
   <div class="prow">
     <span class="p-name">kind</span>
-    <span class="p-type">&quot;create&quot; | &quot;review&quot; | &quot;debrief&quot;</span>
+    <span class="p-type">&quot;text&quot; | &quot;error&quot;</span>
+    <span class="p-desc"></span>
+  </div>
+  <div class="prow">
+    <span class="p-name">text</span>
+    <span class="p-type">string <span class="p-hint">(&le; 8000 chars)</span></span>
+    <span class="p-desc"></span>
+  </div>
+  <div class="prow">
+    <span class="p-name">errorClass</span>
+    <span class="p-type">string</span>
+    <span class="p-desc">Only on <code>error</code>.</span>
+  </div>
+  <div class="prow">
+    <span class="p-name">at</span>
+    <span class="p-type">integer</span>
+    <span class="p-desc">Epoch ms.</span>
+  </div>
+  <div class="prow">
+    <span class="p-name">proposal</span>
+    <span class="p-type"><a href="#schema-CoachProposal">CoachProposal</a></span>
+    <span class="p-desc"></span>
+  </div>
+</div>
+  </div>
+</details>
+
+<details class="ep sch" id="schema-CoachProposal">
+  <summary>
+    <span class="sch-name"><code>CoachProposal</code></span>
+    <span class="ep-chev" aria-hidden="true"></span>
+    <span class="ep-sum">The edits the assistant suggests, checked on the server before they reach the thread (every id exists, every target is there, every number is in range, the whole set applies cleanly to a copy) and checked again on the client before it applies them.</span>
+  </summary>
+  <div class="ep-body">
+<p>All or nothing: Apply runs every change or none.</p>
+<div class="ptab">
+  <div class="prow">
+    <span class="p-name">id</span>
+    <span class="p-type">string</span>
+    <span class="p-desc"></span>
+  </div>
+  <div class="prow">
+    <span class="p-name">summary</span>
+    <span class="p-type">string <span class="p-hint">(&le; 1200 chars)</span></span>
     <span class="p-desc"></span>
   </div>
   <div class="prow">
@@ -4724,192 +4712,92 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
     <span class="p-desc">Epoch ms.</span>
   </div>
   <div class="prow">
-    <span class="p-name">expiresAt</span>
+    <span class="p-name">status</span>
+    <span class="p-type">&quot;pending&quot; | &quot;applied&quot; | &quot;dismissed&quot; | &quot;undone&quot; | &quot;expired&quot;</span>
+    <span class="p-desc"></span>
+  </div>
+  <div class="prow">
+    <span class="p-name">decidedAt</span>
     <span class="p-type">integer</span>
-    <span class="p-desc">Epoch ms.</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">planHash</span>
-    <span class="p-type">string</span>
-    <span class="p-desc">The plan this was written against. A later edit makes it stale.</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">iteration</span>
-    <span class="p-type">integer</span>
-    <span class="p-desc">1, or higher after a refine.</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">summary</span>
-    <span class="p-type">string <span class="p-hint">(&le; 1200 chars)</span></span>
     <span class="p-desc"></span>
   </div>
   <div class="prow">
     <span class="p-name">changes</span>
-    <span class="p-type">object[]</span>
-    <span class="p-desc">A review's change-set, each one applied or rejected on its own.</span>
+    <span class="p-type"><a href="#schema-CoachChange">CoachChange</a>[]</span>
+    <span class="p-desc">Absent on an old proposal, which keeps <code>count</code> and <code>kinds</code> instead.</span>
   </div>
   <div class="prow">
-    <span class="p-name">changes[].id</span>
-    <span class="p-type">string</span>
-    <span class="p-desc"></span>
+    <span class="p-name">count</span>
+    <span class="p-type">integer</span>
+    <span class="p-desc">Only on a proposal whose changes were dropped to keep the thread small.</span>
   </div>
   <div class="prow">
-    <span class="p-name">changes[].type</span>
-    <span class="p-type">&quot;add-exercise&quot; | &quot;remove-exercise&quot; | &quot;swap-exercise&quot; | &quot;sets&quot; | &quot;reps&quot; | &quot;repsMin&quot; | &quot;repsMax&quot; | &quot;sec&quot; | &quot;cardio&quot; | &quot;reorder&quot; | &quot;superset&quot; | &quot;routine-prog&quot; | &quot;exercise-prog&quot; | &quot;inc&quot; | &quot;add-routine&quot; | &quot;remove-routine&quot; | &quot;rename-routine&quot; | &quot;week&quot;</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">changes[].why</span>
-    <span class="p-type">string</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">changes[].before</span>
-    <span class="p-type">object</span>
-    <span class="p-desc">What the plan says now. The client checks it before applying.</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">changes[].after</span>
-    <span class="p-type">object</span>
-    <span class="p-desc">What it would say.</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">evidence</span>
-    <span class="p-type">object</span>
-    <span class="p-desc">The window the review read.</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">evidence.from</span>
-    <span class="p-type">string | null</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">evidence.to</span>
-    <span class="p-type">string | null</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">evidence.sessions</span>
-    <span class="p-type">integer | null</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">notes</span>
+    <span class="p-name">kinds</span>
     <span class="p-type">string[]</span>
     <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">bundle</span>
-    <span class="p-type">object</span>
-    <span class="p-desc">A whole plan, from a <code>create</code> job (routines, week and any custom exercises).</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">bundle.opengym_plan</span>
-    <span class="p-type">always 1</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">bundle.name</span>
-    <span class="p-type">string <span class="p-hint">(&le; 40 chars)</span></span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">bundle.summary</span>
-    <span class="p-type">string</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">bundle.basedOn</span>
-    <span class="p-type">string</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">bundle.week</span>
-    <span class="p-type">object</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">bundle.routines</span>
-    <span class="p-type">object[]</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">bundle.customEx</span>
-    <span class="p-type">object[]</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">score</span>
-    <span class="p-type">integer <span class="p-hint">(1&ndash;10)</span></span>
-    <span class="p-desc">A debrief's score for the session.</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">highlights</span>
-    <span class="p-type">string[]</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">watch</span>
-    <span class="p-type">string[]</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">nextTime</span>
-    <span class="p-type">string[]</span>
-    <span class="p-desc"></span>
-  </div>
-  <div class="prow">
-    <span class="p-name">workout</span>
-    <span class="p-type">object</span>
-    <span class="p-desc">Which session a debrief read.</span>
   </div>
 </div>
   </div>
 </details>
 
-<details class="ep sch" id="schema-CoachIntake">
+<details class="ep sch" id="schema-CoachChange">
   <summary>
-    <span class="sch-name"><code>CoachIntake</code></span>
+    <span class="sch-name"><code>CoachChange</code></span>
     <span class="ep-chev" aria-hidden="true"></span>
-    <span class="ep-sum">The intake answers, as the plan screen collects them.</span>
+    <span class="ep-sum">One change.</span>
   </summary>
   <div class="ep-body">
-<p>Stored in the profile's own state as well; sent here so a plan can be asked for with answers that have not been synced yet.</p>
+<p><code>type</code> is a member of a closed list: the eighteen plan types a plan review always had, and twelve more (<code>dayplan</code>, <code>workout-add</code>, <code>workout-edit</code>, <code>workout-delete</code>, <code>bodyweight-set</code>, <code>bodyweight-delete</code>, <code>exnote-set</code>, <code>custom-ex-add</code>, <code>custom-ex-edit</code>, <code>custom-ex-delete</code>, <code>setting</code>, <code>profile-set</code>). A type not on the list does nothing. <code>before</code> is read off the profile's state by the server, never taken from the model. The weight unit, accounts, other profiles and the server itself are not on any list.</p>
 <div class="ptab">
   <div class="prow">
-    <span class="p-name">goal</span>
-    <span class="p-type">string</span>
-    <span class="p-desc">e.g. <code>muscle</code>, <code>strength</code>, <code>fat-loss</code>.</span>
-  </div>
-  <div class="prow">
-    <span class="p-name">experience</span>
+    <span class="p-name">id</span>
     <span class="p-type">string</span>
     <span class="p-desc"></span>
   </div>
   <div class="prow">
-    <span class="p-name">daysPerWeek</span>
-    <span class="p-type">integer</span>
+    <span class="p-name">type</span>
+    <span class="p-type">&quot;add-exercise&quot; | &quot;remove-exercise&quot; | &quot;swap-exercise&quot; | &quot;sets&quot; | &quot;reps&quot; | &quot;repsMin&quot; | &quot;repsMax&quot; | &quot;sec&quot; | &quot;cardio&quot; | &quot;reorder&quot; | &quot;superset&quot; | &quot;routine-prog&quot; | &quot;exercise-prog&quot; | &quot;inc&quot; | &quot;add-routine&quot; | &quot;remove-routine&quot; | &quot;rename-routine&quot; | &quot;week&quot; | &quot;dayplan&quot; | &quot;workout-add&quot; | &quot;workout-edit&quot; | &quot;workout-delete&quot; | &quot;bodyweight-set&quot; | &quot;bodyweight-delete&quot; | &quot;exnote-set&quot; | &quot;custom-ex-add&quot; | &quot;custom-ex-edit&quot; | &quot;custom-ex-delete&quot; | &quot;setting&quot; | &quot;profile-set&quot;</span>
     <span class="p-desc"></span>
   </div>
   <div class="prow">
-    <span class="p-name">preferredDays</span>
-    <span class="p-type">integer[]</span>
-    <span class="p-desc">0 = Sunday.</span>
+    <span class="p-name">target</span>
+    <span class="p-type">object</span>
+    <span class="p-desc">What it is about: <code>routineId</code>, <code>exId</code>, <code>weekday</code>, <code>workoutId</code>, <code>date</code>, <code>key</code>.</span>
   </div>
   <div class="prow">
-    <span class="p-name">sessionMin</span>
-    <span class="p-type">integer</span>
-    <span class="p-desc">Minutes per session.</span>
+    <span class="p-name">before</span>
+    <span class="p-type">object</span>
+    <span class="p-desc">What the data says now. The client checks it before applying.</span>
   </div>
   <div class="prow">
-    <span class="p-name">equipment</span>
-    <span class="p-type">string[]</span>
-    <span class="p-desc"></span>
+    <span class="p-name">after</span>
+    <span class="p-type">object</span>
+    <span class="p-desc">What it would say.</span>
   </div>
   <div class="prow">
-    <span class="p-name">limitations</span>
+    <span class="p-name">why</span>
+    <span class="p-type">string <span class="p-hint">(&le; 600 chars)</span></span>
+    <span class="p-desc">The assistant's reason</span>
+  </div>
+  <div class="prow">
+    <span class="p-name">lines</span>
+    <span class="p-type">object[]</span>
+    <span class="p-desc">Before and after as plain strings, for the card (the non-plan types).</span>
+  </div>
+  <div class="prow">
+    <span class="p-name">lines[].k</span>
     <span class="p-type">string</span>
-    <span class="p-desc">Injuries and anything to work around.</span>
+    <span class="p-desc"></span>
+  </div>
+  <div class="prow">
+    <span class="p-name">lines[].before</span>
+    <span class="p-type">string | null</span>
+    <span class="p-desc"></span>
+  </div>
+  <div class="prow">
+    <span class="p-name">lines[].after</span>
+    <span class="p-type">string | null</span>
+    <span class="p-desc"></span>
   </div>
 </div>
   </div>
@@ -5021,6 +4909,11 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
     <span class="p-name">disabledByEnv</span>
     <span class="p-type">boolean</span>
     <span class="p-desc">COACH_DISABLED is set, so nothing the admin toggles matters.</span>
+  </div>
+  <div class="prow">
+    <span class="p-name">assistant</span>
+    <span class="p-type">boolean</span>
+    <span class="p-desc">Whether the configured provider can run the assistant (a tool loop): the Claude provider and the Anthropic API can, the others cannot.</span>
   </div>
   <div class="prow">
     <span class="p-name">enabled</span>
@@ -5135,7 +5028,7 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
   <div class="prow">
     <span class="p-name">maxMessageLen</span>
     <span class="p-type">integer</span>
-    <span class="p-desc">How long a chat message, refinement or review note can be (200–4000, default 1000).</span>
+    <span class="p-desc">How long a chat message can be (200–4000, default 1000).</span>
   </div>
   <div class="prow">
     <span class="p-name">community</span>
@@ -5255,7 +5148,7 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
   <div class="prow">
     <span class="p-name">recent[].kind</span>
     <span class="p-type">string</span>
-    <span class="p-desc"></span>
+    <span class="p-desc"><code>chat</code> for a message; older entries may read <code>create</code>, <code>review</code>, <code>debrief</code>.</span>
   </div>
   <div class="prow">
     <span class="p-name">recent[].trigger</span>

@@ -16,8 +16,6 @@ import webpush from 'web-push';
 import * as coachConfig from './coach/config.js';
 import * as coachJobs from './coach/jobs.js';
 import { coachRoutes } from './coach/routes.js';
-import { startCadence } from './coach/cadence.js';
-import { startWarmup } from './coach/warmup.js';
 import { dayReminderPush, nudgePush, restTimerPush, testPush } from './push-messages.js';
 import { verifyError } from './verify-error.js';
 import {
@@ -2581,23 +2579,21 @@ const routes = {
   ...(MEDIA_ON ? mediaRoutes : {})
 };
 
-/* ---------- Coach: boot recovery, notifications, scheduled reviews ---------- */
+/* ---------- Coach: boot recovery and notifications ---------- */
 // A job that was running when the process died is not coming back; say so rather than leaving
 // a spinner that never resolves.
 coachJobs.recoverOnBoot();
-// A ready proposal is the one Coach event worth a notification. Failures and "nothing to
-// change" stay silent on purpose (FR-38/E4).
-coachJobs.setProposalHook((uid, pending) => {
-  const n = (pending?.changes || []).length;
+// A proposal that took a while is the one Coach event worth a notification (the person has
+// probably looked away). Failures and plain answers stay silent on purpose (FR-38/E4).
+coachJobs.setProposalHook((uid, proposal) => {
+  const n = (proposal?.changes || []).length;
   if (!n) return;
   sendPush(uid, {
-    title: 'Your Coach has been reading',
-    body: n === 1 ? '1 suggestion after this week' : `${n} suggestions after this week`,
+    title: 'Your assistant has a suggestion',
+    body: n === 1 ? '1 change is waiting for you' : `${n} changes are waiting for you`,
     tag: 'coach-proposal', url: '#/coach'
   });
 });
-startCadence({ users: () => db.users, userNow });
-startWarmup();
 
 // node's requestTimeout is one number for every route, and it is half an hour (below) for the
 // sake of one: a video uploaded over a slow uplink. Every other request keeps node's old five

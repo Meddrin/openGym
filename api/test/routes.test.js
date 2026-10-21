@@ -151,23 +151,28 @@ test('the compatible endpoint: base URL is validated, a keyless endpoint counts 
   } finally { mock.close(); }
 });
 
-test('the disclosure names the provider and the same five categories the payload builds from', async () => {
+test('the disclosure names the provider and the categories the assistant tools can return', async () => {
   fresh({ provider: 'gemini' });
   const { call } = harness();
   const r = await call('GET /api/coach/disclosure');
   assert.equal(r.status, 200);
   assert.equal(r.body.providerLabel, 'Google Gemini');
-  assert.deepEqual(r.body.categories, ['plan', 'training', 'bodyweight', 'profile', 'prefs']);
+  assert.deepEqual(r.body.categories, ['plan', 'training', 'bodyweight', 'profile', 'prefs', 'chat']);
+  assert.equal(r.body.flow, 'tools', 'the screen says the data moves one tool call at a time');
+  assert.equal(r.body.version, 2);
 });
 
-/* ---------- debrief + cohort routes ---------- */
-test('a debrief is enqueued as its own kind, and the cohort routes gate on the admin switch and the opt-in', async () => {
+/* ---------- the chat routes, and the cohort routes ---------- */
+test('a message is a job, the thread and its proposal are readable, decisions are recorded, and the cohort routes gate on the admin switch and the opt-in', async () => {
   fresh({ community: false });
   const jobs = await import('../coach/jobs.js');
   const { writeState, sampleState } = await import('./helpers.mjs');
   const { forcePrivilegeVerdict } = await import('../coach/adapters/spawn.js');
   forcePrivilegeVerdict({ ok: true, dropped: false, why: 'pinned by the test suite' });
-  writeState(process.env.DATA_DIR, 'admin-1', sampleState());
+  // A recent workout, so the room counts this profile (it reads a window of recent weeks).
+  const recent = sampleState();
+  recent.workouts[0].d = new Date().toISOString().slice(0, 10);
+  writeState(process.env.DATA_DIR, 'admin-1', recent);
   const { call } = harness();
 
   const off = await call('GET /api/coach/cohort');
@@ -189,25 +194,41 @@ test('a debrief is enqueued as its own kind, and the cohort routes gate on the a
   assert.equal(alone.body.sharing, true);
   assert.equal(alone.body.people, 1);
 
-  const r = await call('POST /api/coach/debrief', { workoutId: 'w1' });
+  // An empty message is a 400 and spends nothing.
+  const empty = await call('POST /api/coach/message', { text: '  ' });
+  assert.equal(empty.status, 400);
+  assert.equal(empty.body.code, 'empty');
+
+  const r = await call('POST /api/coach/message', { text: 'please log my weight' });
   assert.equal(r.status, 202);
-  assert.equal(jobs.status('admin-1').job.kind, 'debrief');
+  assert.ok(r.body.job.id);
+  assert.equal(r.body.message.role, 'user');
   const until = Date.now() + 15000;
   while (jobs.status('admin-1').job && Date.now() < until) await new Promise(res => setTimeout(res, 25));
-  const s = jobs.status('admin-1');
-  assert.equal(s.pending.kind, 'debrief');
-  assert.deepEqual(s.pending.workout, { id: 'w1', d: '2026-07-20', name: 'Full body A', minutes: 45, vol: 600, sets: 3, prs: 0 });
-  assert.equal(s.pending.score, 8);
-  assert.ok(s.pending.summary.includes('3 sets'));
-  assert.ok(Array.isArray(s.pending.nextTime) && s.pending.nextTime.length);
-  assert.equal('changes' in s.pending, false);
+  const status = (await call('GET /api/coach/status')).body;
+  assert.equal(status.job, null);
+  assert.equal(status.assistant.supported, true);
 
-  // A profile with nothing logged cannot be debriefed.
-  jobs.resolvePending('admin-1', { accepted: ['debrief'] });
-  writeState(process.env.DATA_DIR, 'admin-1', sampleState({ workouts: [] }));
-  await call('POST /api/coach/debrief', {});
-  while (jobs.status('admin-1').job && Date.now() < until) await new Promise(res => setTimeout(res, 25));
-  assert.equal(jobs.status('admin-1').last.errorClass, 'noworkout');
+  const thread = (await call('GET /api/coach/chat')).body;
+  assert.equal(thread.chatRev, status.chatRev);
+  assert.deepEqual(thread.chat.map(m => m.role), ['user', 'assistant']);
+  const p = thread.chat[1].proposal;
+  assert.equal(p.status, 'pending');
+  assert.equal(p.changes[0].type, 'bodyweight-set');
+
+  // Deciding: only the three known statuses, and only forward.
+  assert.equal((await call('POST /api/coach/proposal/resolve', { id: p.id, status: 'bogus' })).status, 400);
+  assert.equal((await call('POST /api/coach/proposal/resolve', { id: 'nope', status: 'applied' })).status, 404);
+  assert.equal((await call('POST /api/coach/proposal/resolve', { id: p.id, status: 'undone' })).status, 409);
+  const applied = await call('POST /api/coach/proposal/resolve', { id: p.id, status: 'applied' });
+  assert.deepEqual(applied.body, { ok: true, status: 'applied' });
+  assert.equal((await call('GET /api/coach/chat')).body.chat[1].proposal.status, 'applied');
+  assert.ok((await call('GET /api/coach/status')).body.chatRev > status.chatRev, 'a decision moves the revision, so other devices re-read the thread');
+
+  // The routes of the structured Coach are gone.
+  for (const gone of ['POST /api/coach/plan', 'POST /api/coach/review', 'POST /api/coach/debrief', 'POST /api/coach/pending/resolve']) {
+    assert.equal(harness().routes[gone], undefined, gone);
+  }
 });
 
 /* ---------- configurable max message length (issue #267) ---------- */
@@ -240,8 +261,8 @@ test('an admin can raise the Coach message length past the old 1000-char default
 // translated line for it and a German lifter read "the Coach is not set up on this instance". It
 // names the class now: 'off', the class enqueue's own refusal carries for the same state.
 test('the Coach-off guard names its class beside the words, on every guarded user route', async () => {
-  const guarded = ['GET /api/coach/status', 'POST /api/coach/plan', 'POST /api/coach/review', 'POST /api/coach/debrief',
-    'GET /api/coach/cohort', 'POST /api/coach/cohort/share', 'POST /api/coach/pending/resolve'];
+  const guarded = ['GET /api/coach/status', 'GET /api/coach/chat', 'POST /api/coach/message', 'POST /api/coach/proposal/resolve',
+    'GET /api/coach/cohort', 'POST /api/coach/cohort/share'];
   const refusal = { error: 'the Coach is not set up on this instance', code: 'off' };
   const { call } = harness();
   for (const [state, patch] of [['switched off', { enabled: false }], ['no provider connected', { provider: 'anthropic' }]]) {

@@ -1,11 +1,16 @@
-/* Running Coach jobs, and owning their results.
+/* Running assistant jobs, and owning the conversation.
  *
- * Why the server owns proposals instead of the synced state blob: a client PUTs its whole
- * state and the newest `_ts` wins. A scheduled review that wrote its proposal in there would
- * be erased without trace by the next device to sync an older copy. So the proposal lives
- * here, in a file this server alone writes, until the user decides what to do with it — at
- * which point the *client* applies it to the plan and the outcome joins the synced log, which
- * is exactly where an audit trail belongs.
+ * One chat message is one job. The conversation lives here, in a file this server alone writes
+ * (coach/<uid>.json), for the same reason a proposal always did: a client PUTs its whole state
+ * and the newest `_ts` wins, so a reply or a proposal written into that blob would be erased
+ * without trace by the next device to sync an older copy. Here the reply is safe whether the
+ * phone is open or not, every device reads the same thread, and forgetting the Coach deletes it
+ * (clearUser) with nothing left behind.
+ *
+ * A proposal rides on the assistant message that made it, with a status the client reports when
+ * the person decides: pending, applied, dismissed, undone. Applying it is the client's work
+ * (frontend/src/lib/coach-changes.js): ordinary local edits, so the sync carries them; the
+ * server only records the decision, so the next message can say what happened to the last one.
  *
  * Everything here is deliberately in-process and file-backed. A single-core box running one
  * household's gym app does not need a job queue with a broker; it needs jobs that cannot pile
@@ -18,20 +23,12 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import * as cfgStore from './config.js';
 import { adapterFor } from './adapters/index.js';
-import * as payloadLib from './core/payload.js';
-import { runPipeline } from './core/pipeline.js';
-import { extractJSON } from './core/parse.js';
-import { hashPlan } from './core/plan-hash.js';
-import { buildPrompt } from './core/prompt.js';
-import { handleFor } from './handle.js';
+import { langTag } from './core/payload.js';
 import { fetchFor } from './node-fetch.js';
 import { canDropPrivileges, unprivilegedIds } from './adapters/spawn.js';
-import { cohortForPayload, invalidate as invalidateCohort } from './cohort.js';
-
-// The prompt assembly, the plan fingerprint and the invoke→parse→validate→repair loop all
-// live in ./core now, where the phone can import them too. Re-exported so nothing that
-// reached them through this module has to move.
-export { hashPlan, buildPrompt };
+import { invalidate as invalidateCohort } from './cohort.js';
+import { createToolset, todayFor } from './assistant/tools.js';
+import { SYSTEM_PROMPT, buildPrompt } from './assistant/prompt.js';
 
 const DATA = process.env.DATA_DIR || '/data';
 const COACH_DIR = path.join(DATA, 'coach');
@@ -40,18 +37,28 @@ const COACH_DIR = path.join(DATA, 'coach');
 // cloud API that needs more has a problem. COACH_JOB_TIMEOUT_MS overrides, never below one minute.
 export const TIMEOUT_MS = Math.max(60000, +process.env.COACH_JOB_TIMEOUT_MS || 5 * 60000);
 const MAX_CONCURRENT = 2;          // these are minutes-scale jobs on often-single-core boxes
-const PENDING_DAYS = 14;           // FR-33
-const HISTORY_MAX = 20;
+const PENDING_DAYS = 14;           // an undecided proposal stops being offered after this
+const HISTORY_MAX = 20;            // outcomes kept, for the status line and the admin card
+// The conversation is bounded twice: by count, and by bytes, because a proposal of twenty-five
+// changes is far bigger than a sentence. Only the newest few proposals keep their changes; older
+// ones keep what the thread needs to read them back (what, how many, what happened).
+export const CHAT_MAX = 60;
+export const CHAT_BYTES_MAX = 400 * 1024;
+export const FULL_PROPOSALS = 8;
+export const TEXT_MAX = 8000;
 
 /* ---------- per-user store ---------- */
 
 const safe = uid => String(uid).replace(/[^a-zA-Z0-9_-]/g, '');
 const userFile = uid => path.join(COACH_DIR, safe(uid) + '.json');
-const EMPTY = { daily: null, current: null, pending: null, history: [] };
+const EMPTY = { daily: null, current: null, chat: [], rev: 0, history: [] };
 
 export function readUser(uid) {
-  try { return { ...EMPTY, ...JSON.parse(fs.readFileSync(userFile(uid), 'utf8')) }; }
-  catch { return { ...EMPTY }; }
+  try {
+    const rec = { ...EMPTY, ...JSON.parse(fs.readFileSync(userFile(uid), 'utf8')) };
+    delete rec.pending;       // proposals live on the chat message that made them now
+    return rec;
+  } catch { return { ...EMPTY }; }
 }
 function writeUser(uid, rec) {
   fs.mkdirSync(COACH_DIR, { recursive: true, mode: 0o700 });
@@ -133,35 +140,94 @@ function instanceUsedToday() {
   return daily?.date === todayISO() ? daily.count : 0;
 }
 
+/* ---------- the conversation ---------- */
+
+const newId = () => crypto.randomBytes(6).toString('hex');
+
+/** An old proposal, reduced to what the thread needs to show it again. */
+function compactProposal(p) {
+  if (!p || !Array.isArray(p.changes)) return p;
+  const { changes, ...rest } = p;
+  return { ...rest, count: changes.length, kinds: [...new Set(changes.map(c => c.type))].slice(0, 8), changes: undefined };
+}
+
+/** Keep the thread inside its bounds: newest proposals whole, the rest compact, oldest dropped. */
+export function boundChat(chat) {
+  let out = chat.slice(-CHAT_MAX);
+  let seen = 0;
+  for (let i = out.length - 1; i >= 0; i--) {
+    const p = out[i].proposal;
+    if (p && Array.isArray(p.changes)) { if (++seen > FULL_PROPOSALS) out[i] = { ...out[i], proposal: compactProposal(p) }; }
+  }
+  while (out.length > 4 && JSON.stringify(out).length > CHAT_BYTES_MAX) out = out.slice(1);
+  return out;
+}
+
+/** A proposal nobody answered for two weeks is no longer on offer. Applied lazily, on read. */
+function expire(chat) {
+  let changed = false;
+  const cutoff = Date.now() - PENDING_DAYS * 86400000;
+  const out = chat.map(m => {
+    const p = m.proposal;
+    if (p && p.status === 'pending' && (p.createdAt || 0) < cutoff) { changed = true; return { ...m, proposal: { ...p, status: 'expired', decidedAt: Date.now() } }; }
+    return m;
+  });
+  return { chat: out, changed };
+}
+
+function appendChat(uid, msg) {
+  const rec = readUser(uid);
+  const chat = boundChat([...(rec.chat || []), msg]);
+  writeUser(uid, { ...rec, chat, rev: (rec.rev || 0) + 1 });
+}
+
+/** The thread, oldest first. */
+export function readChat(uid) {
+  const rec = readUser(uid);
+  const { chat, changed } = expire(rec.chat || []);
+  if (changed) writeUser(uid, { ...rec, chat, rev: (rec.rev || 0) + 1 });
+  return chat;
+}
+
+const STATUS_NEXT = { pending: ['applied', 'dismissed'], applied: ['undone'] };
+/**
+ * The person decided what to do with a proposal. The change itself already happened, or did
+ * not, on their device; this records it so the next message can say so. Only moves the status
+ * forward along pending -> applied | dismissed and applied -> undone.
+ */
+export function resolveProposal(uid, id, status) {
+  const rec = readUser(uid);
+  const { chat } = expire(rec.chat || []);
+  const i = chat.findIndex(m => m.proposal && m.proposal.id === id);
+  if (i < 0) return { ok: false, code: 'unknown' };
+  const p = chat[i].proposal;
+  if (!(STATUS_NEXT[p.status] || []).includes(status)) return { ok: false, code: 'state', status: p.status };
+  chat[i] = { ...chat[i], proposal: { ...p, status, decidedAt: Date.now() } };
+  writeUser(uid, { ...rec, chat, rev: (rec.rev || 0) + 1 });
+  return { ok: true, status };
+}
+
 /* ---------- status ---------- */
 
-/** What the client polls. Expiry is enforced lazily here rather than on a timer. */
+/** What the client polls. `chatRev` changes whenever the thread does, so the client fetches the
+ *  thread only when it has something new to read. */
 export function status(uid) {
   const rec = readUser(uid);
-  if (rec.pending && rec.pending.expiresAt && rec.pending.expiresAt < Date.now()) {
-    archive(uid, rec, 'expired');
-    // Same shape as every other answer: the poll that happens to be the one which expires a
-    // proposal must not be the one where the client's cap readout goes undefined.
-    return { job: null, pending: null, cap: capState(uid) };
-  }
+  const cfg = cfgStore.load();
   return {
-    job: rec.current ? { id: rec.current.id, kind: rec.current.kind, state: rec.current.state, startedAt: rec.current.startedAt } : null,
-    pending: rec.pending || null,
+    job: rec.current ? { id: rec.current.id, state: rec.current.state, startedAt: rec.current.startedAt } : null,
     cap: capState(uid),
-    // How the most recent job ended, so the chat can say "nothing to change" or "that failed"
-    // in the Coach's own bubble rather than leaving a job that silently stopped appearing.
-    last: lastOutcome(rec)
+    // How the most recent job ended, so the chat can close a job that failed before the first poll.
+    last: lastOutcome(rec),
+    chatRev: rec.rev || 0,
+    // Whether the configured provider can run the assistant at all, so the screen can say which
+    // provider it needs before anybody types a message.
+    assistant: { supported: adapterFor(cfg.provider)?.tools === true, provider: cfg.provider }
   };
 }
 function lastOutcome(rec) {
   const h = (rec.history || []).at(-1);
-  return h ? { id: h.id, kind: h.kind, outcome: h.outcome, errorClass: h.errorClass || null, at: h.at, ...(h.reading ? { reading: h.reading } : {}) } : null;
-}
-function archive(uid, rec, outcome) {
-  const history = [...(rec.history || []), {
-    id: rec.pending?.id, kind: rec.pending?.kind, outcome, at: Date.now()
-  }].slice(-HISTORY_MAX);
-  patchUser(uid, { pending: null, history });
+  return h ? { id: h.id, outcome: h.outcome, errorClass: h.errorClass || null, at: h.at } : null;
 }
 
 /* ---------- the queue ---------- */
@@ -178,11 +244,9 @@ class CoachError extends Error {
 export { CoachError };
 
 /**
- * Clamp a free-text note/refine message to the admin's configured `maxMessageLen` (issue #267).
- * The one place this is enforced — `routes.js` only applies a generous sanity ceiling before a
- * string reaches here, and `payload.js`'s own bound exists purely so a caller that skips this
- * module (coach-local.js's in-process pipeline) still has a limit. Exported so the clamp itself
- * is directly testable without walking the whole enqueue → execute pipeline.
+ * Clamp a chat message to the admin's configured `maxMessageLen` (issue #267). The one place
+ * this is enforced — `routes.js` only applies a generous sanity ceiling before a string reaches
+ * here. Exported so the clamp itself is directly testable without walking the whole pipeline.
  */
 export function clampMessage(text) {
   if (!text) return null;
@@ -191,12 +255,18 @@ export function clampMessage(text) {
 }
 
 /**
- * Enqueue a job. Throws CoachError with a code the routes layer maps to an HTTP status:
- * `off`, `busy`, `cap`, `consent`.
+ * Enqueue the job for one chat message. Throws CoachError with a code the routes layer maps to
+ * an HTTP status: `off`, `tools`, `empty`, `busy`, `cap`, `consent`, `shared`, `account`,
+ * `unprivileged`. Returns { id, message } — the job and the user's message as stored.
  */
-export function enqueue(uid, opts) {
+export function enqueue(uid, opts = {}) {
   if (!cfgStore.isEnabled() || !cfgStore.isConnected()) throw new CoachError('off', 'the Coach is not set up on this instance');
-  if (inflight.has(uid)) throw new CoachError('busy', 'the Coach is already thinking about your training');
+  // The assistant is a tool loop. A provider that cannot run one is refused here, plainly,
+  // rather than answering from nothing and sounding as if it had looked.
+  if (adapterFor(cfgStore.load().provider)?.tools !== true) throw new CoachError('tools', 'the assistant needs the Claude provider (or the Anthropic API) on this instance');
+  const text = clampMessage(typeof opts.text === 'string' ? opts.text.trim() : '');
+  if (!text) throw new CoachError('empty', 'write a message first');
+  if (inflight.has(uid)) throw new CoachError('busy', 'the assistant is already answering you');
 
   const S = readState(uid);
   // Consent is enforced here, server-side, not by the screen that collects it: a UI-only gate
@@ -215,9 +285,6 @@ export function enqueue(uid, opts) {
     if (cred.mode === 'profile') throw new CoachError('account', cred.message);
     throw new CoachError('off', 'this profile has no provider account connected');
   }
-  // Spending is what binds: a personal credential (setup token, OAuth) belongs to the first
-  // profile that runs a job on it from here on; an API key binds to nobody and is shared.
-  cfgStore.bindInstanceCredential(uid);
 
   // The privilege drop is what keeps a provider runtime out of ./data. If it cannot be
   // performed, there is no job — see canDropPrivileges for why this is not a warning either.
@@ -232,31 +299,33 @@ export function enqueue(uid, opts) {
   if (limit > 0 && used >= limit) throw new CoachError('cap', 'daily limit reached');
   if (caps.instanceDaily > 0 && instanceUsedToday() >= caps.instanceDaily) throw new CoachError('cap', 'this instance has reached its daily limit');
 
+  // Spending is what binds: a personal credential (setup token, OAuth) belongs to the first
+  // profile that runs a job on it from here on; an API key binds to nobody and is shared.
+  cfgStore.bindInstanceCredential(uid);
+
   // Counted at enqueue, not at completion: the cap exists to bound what one profile can spend
   // of the owner's provider account, and queueing twenty jobs spends it whether or not the
   // twentieth ever finishes.
   bumpDaily(uid);
   bumpInstanceDaily();
 
+  const message = { id: newId(), role: 'user', kind: 'text', text, at: Date.now() };
   const job = {
     id: crypto.randomBytes(8).toString('hex'),
     uid,
     forgetSeq: forgetSeq.get(uid) || 0,
-    kind: opts.kind,                                  // 'create' | 'review' | 'debrief'
-    trigger: opts.trigger || 'manual',                // 'manual' | 'scheduled'
-    workoutId: opts.workoutId ? String(opts.workoutId).slice(0, 40) : null,
-    intake: opts.intake || null,
-    note: clampMessage(opts.note),
-    refine: clampMessage(opts.refine),
-    lang: payloadLib.langTag(opts.lang),              // the language the app was showing (#303)
+    messageId: message.id,
+    text,
+    lang: langTag(opts.lang),                         // the language the app was showing (#303)
     state: 'queued',
     startedAt: Date.now()
   };
   inflight.add(uid);
-  patchUser(uid, { current: { id: job.id, kind: job.kind, state: 'queued', startedAt: job.startedAt } });
+  appendChat(uid, message);
+  patchUser(uid, { current: { id: job.id, state: 'queued', startedAt: job.startedAt } });
   queue.push(job);
   pump();
-  return { id: job.id };
+  return { id: job.id, message };
 }
 
 function pump() {
@@ -269,18 +338,9 @@ function pump() {
   }
 }
 
-/* Why an answer was rejected, for the admin card. "Couldn't use" with no reason left people
-   guessing whether the model, the key or the app was at fault. The validator's own lines say
-   which rule broke; quoted values are cut out, because they can carry a routine name or other
-   words from the person's plan, and the instance log carries outcomes, not content (FR-12/42). */
-export function whyUnusable(errors) {
-  if (!Array.isArray(errors) || !errors.length) return null;
-  return errors.slice(0, 3).map(e => String(e).replace(/"[^"]*"/g, '"…"')).join('; ').slice(0, 300);
-}
-
 function finish(job, result) {
   cfgStore.logJob({
-    at: new Date().toISOString(), uid: job.uid, kind: job.kind, trigger: job.trigger,
+    at: new Date().toISOString(), uid: job.uid, kind: 'chat', trigger: 'manual',
     outcome: result.outcome, errorClass: result.errorClass || null,
     ms: Date.now() - job.startedAt, detail: result.detail || null
   });
@@ -289,22 +349,16 @@ function finish(job, result) {
   if ((forgetSeq.get(job.uid) || 0) !== job.forgetSeq) return;
   const rec = readUser(job.uid);
   const history = [...(rec.history || []), {
-    id: job.id, kind: job.kind, trigger: job.trigger, outcome: result.outcome,
-    errorClass: result.errorClass || null, at: Date.now(),
-    // "Nothing to change" is an answer with a reason attached, and throwing the reason away
-    // leaves the user with a job that finished and nothing to show for it. It lives here, in
-    // the profile's own file — deliberately not in `detail`, which goes to the instance log
-    // the admin card renders, and which carries counts and outcomes only (FR-12/42).
-    ...(result.reading ? { reading: String(result.reading).slice(0, 1200) } : {})
+    id: job.id, outcome: result.outcome, errorClass: result.errorClass || null, at: Date.now()
   }].slice(-HISTORY_MAX);
-  writeUser(job.uid, {
-    ...rec,
-    current: null,
-    pending: result.pending !== undefined ? result.pending : rec.pending,
-    history
-  });
-  if (result.outcome === 'ready' && onProposal) {
-    try { onProposal(job.uid, result.pending, job); } catch (e) { console.error('coach notify failed', e); }
+  // The reply joins the thread in the same write that clears the job, so a poll can never see
+  // a finished job without its answer.
+  const chat = boundChat([...(rec.chat || []), result.message]);
+  writeUser(job.uid, { ...rec, current: null, chat, rev: (rec.rev || 0) + 1, history });
+  // A proposal is the one event worth a notification, and only when the person has probably
+  // looked away (a reply that took a while). Failures stay silent (FR-38).
+  if (result.outcome === 'ready' && result.message.proposal && Date.now() - job.startedAt > 20000 && onProposal) {
+    try { onProposal(job.uid, result.message.proposal, job); } catch (e) { console.error('coach notify failed', e); }
   }
 }
 
@@ -313,49 +367,39 @@ function finish(job, result) {
 let onProposal = null;
 export function setProposalHook(fn) { onProposal = fn; }
 
+const failed = (errorClass, detail) => ({ outcome: 'failed', errorClass, ...(detail ? { detail } : {}) });
+const errorMessage = errorClass => ({ id: newId(), role: 'assistant', kind: 'error', text: '', errorClass, at: Date.now() });
+
 /* ---------- execution ---------- */
 
 async function execute(job) {
-  patchUser(job.uid, { current: { id: job.id, kind: job.kind, state: 'running', startedAt: job.startedAt } });
+  patchUser(job.uid, { current: { id: job.id, state: 'running', startedAt: job.startedAt } });
+  const stop = (errorClass, detail) => finish(job, { ...failed(errorClass, detail), message: errorMessage(errorClass) });
 
   const S = readState(job.uid);
-  if (!S) return finish(job, { outcome: 'failed', errorClass: 'nostate' });
+  if (!S) return stop('nostate');
   // Checked again here, not only at enqueue: a job can wait behind two others, and consent
-  // withdrawn or the Coach switched off in the meantime means no payload leaves for it.
-  if (!S.coach?.consent?.agreedAt) return finish(job, { outcome: 'failed', errorClass: 'consent' });
-  if (!cfgStore.isEnabled()) return finish(job, { outcome: 'failed', errorClass: 'off' });
+  // withdrawn or the Coach switched off in the meantime means nothing leaves for it.
+  if (!S.coach?.consent?.agreedAt) return stop('consent');
+  if (!cfgStore.isEnabled()) return stop('off');
 
   const cfg = cfgStore.load();
   const adapter = adapterFor(cfg.provider);
-  if (!adapter) return finish(job, { outcome: 'failed', errorClass: 'off' });
+  if (!adapter) return stop('off');
+  if (adapter.tools !== true) return stop('tools');
 
-  if (job.kind === 'debrief' && !payloadLib.findWorkout(S, job.workoutId)) {
-    return finish(job, { outcome: 'failed', errorClass: 'noworkout' });
-  }
-
-  const pendingCreate = job.refine ? readUser(job.uid).pending : null;
-  const payload = payloadLib.build(S, {
-    handle: handleFor(job.uid),
-    kind: job.kind,
-    intake: job.intake,
-    note: job.note,
-    refine: job.refine,
-    previous: pendingCreate?.bundle || null,
-    workoutId: job.workoutId,
-    // The app says which language it is in. A scheduled review has no app behind it: a profile
-    // that never picked a language then gets the instance's DEFAULT_LANG, like its screens do.
-    lang: job.lang || (S.langAuto === true ? payloadLib.langTag(process.env.DEFAULT_LANG) : null),
-    // The room's medians ride along on a review or a debrief when the admin allows it and
-    // this person opted in; null otherwise, and the payload then carries no `cohort` at all.
-    cohort: (job.kind === 'review' || job.kind === 'debrief') ? cohortForPayload(job.uid) : null
+  // The earlier thread, without the message this job answers.
+  const before = [];
+  for (const m of readUser(job.uid).chat || []) { if (m.id === job.messageId) break; before.push(m); }
+  const prompt = buildPrompt({
+    history: before, message: job.text, today: todayFor(S),
+    // The app says which language it is showing. A profile that never picked one gets the
+    // instance's DEFAULT_LANG, like its screens do.
+    lang: job.lang || (S.langAuto === true ? langTag(process.env.DEFAULT_LANG) : null) || langTag(S.lang),
+    unit: S.unit === 'lb' ? 'lb' : 'kg'
   });
-  // The payload is paid for with the instance's key, and it is built from state the client
-  // wrote. The builder bounds each field; a payload that is still bigger than any real training
-  // history makes is refused here, before a provider is called, rather than sent and billed.
-  const size = JSON.stringify(payload).length;
-  if (size > payloadLib.MAX_PAYLOAD_CHARS) {
-    return finish(job, { outcome: 'failed', errorClass: 'toolarge', detail: `payload of ${Math.round(size / 1000)}k characters` });
-  }
+  // Bound to this profile here, once: nothing the model sends can name another.
+  const toolset = createToolset({ uid: job.uid, readState });
 
   // An HTTPS provider has no child process, so no directory for one to live in either.
   const jobDir = adapter.spawns === false ? null : fs.mkdtempSync(path.join(os.tmpdir(), 'coach-'));
@@ -366,51 +410,36 @@ async function execute(job) {
     const ids = jobDir && unprivilegedIds();
     if (ids) shareJobDir(jobDir, ids);
 
-    const attempt = await runPipeline({
-      adapter, cfg, kind: job.kind, payload, model: cfgStore.modelFor(cfg), timeoutMs: TIMEOUT_MS,
+    const r = await adapter.invoke({
+      cfg, prompt, system: SYSTEM_PROMPT, tools: toolset,
+      model: cfgStore.modelFor(cfg), timeoutMs: TIMEOUT_MS,
       // The HTTP adapters take the fetch and the abort signal they are given; the runtime
       // adapters ignore both.
-      invokeOpts: { jobDir, env, fetch: fetchFor(TIMEOUT_MS), signal: ctl.signal, maxTokens: cfg.maxOutputTokens }
+      jobDir, env, fetch: fetchFor(TIMEOUT_MS), signal: ctl.signal, maxTokens: cfg.maxOutputTokens
     });
-    if (!attempt.ok) {
-      // Cancelled by a forget, not failed by the provider: the log must not blame the job budget.
-      const errorClass = ctl.signal.aborted ? 'forgotten' : attempt.errorClass;
-      return finish(job, { outcome: 'failed', errorClass, detail: attempt.detail || whyUnusable(attempt.errors) });
+    // Cancelled by a forget, not failed by the provider: the log must not blame the job budget.
+    if (ctl.signal.aborted) return stop('forgotten');
+    if (r.timedOut) return stop('timeout');
+    if (r.spawnError) return stop('missing', r.stderr?.slice(0, 300));
+    if (r.code !== 0) {
+      const err = (r.stderr || r.text || '').toLowerCase();
+      const authish = /auth|unauthor|api key|credential|token|401|403|login/.test(err);
+      return stop(authish ? 'auth' : 'provider', (r.stderr || r.text || '').slice(0, 300));
     }
-    if (attempt.nochange) {
-      return finish(job, { outcome: 'nochange', pending: null, detail: null, reading: attempt.reading });
-    }
-    const pending = {
-      id: job.id,
-      kind: job.kind,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + PENDING_DAYS * 86400000,
-      planHash: hashPlan(payloadLib.canonicalPlan(S)),
-      iteration: job.refine ? (pendingCreate?.iteration || 1) + 1 : 1,
-      // A debrief names the session it read, so the card can show it after the fact.
-      ...(job.kind === 'debrief' ? { workout: payloadLib.workoutMeta(S, job.workoutId) } : {}),
-      ...attempt.result
+
+    const proposal = toolset.proposal();
+    let text = String(r.text || '').trim().slice(0, TEXT_MAX);
+    if (!text && proposal) text = proposal.summary || '';
+    if (!text) return stop('unusable', 'the assistant answered with nothing');
+    const message = {
+      id: newId(), role: 'assistant', kind: 'text', text, at: Date.now(),
+      ...(proposal ? { proposal: { id: proposal.id, summary: proposal.summary || '', createdAt: proposal.createdAt, status: 'pending', changes: proposal.changes } } : {})
     };
-    return finish(job, { outcome: 'ready', pending });
+    return finish(job, { outcome: 'ready', message, detail: `${toolset.calls().length} tool calls` });
   } finally {
     aborts.delete(job.uid);
     if (jobDir) removeJobDir(jobDir, unprivilegedIds());
   }
-}
-
-/* ---------- decisions ---------- */
-
-/** The client has applied (or discarded) the pending proposal. Record it and clear. */
-export function resolvePending(uid, { accepted = [], rejected = [], dismissed = false } = {}) {
-  const rec = readUser(uid);
-  if (!rec.pending) return { ok: true };
-  const history = [...(rec.history || []), {
-    id: rec.pending.id, kind: rec.pending.kind,
-    outcome: dismissed ? 'dismissed' : 'applied',
-    accepted: accepted.length, rejected: rejected.length, at: Date.now()
-  }].slice(-HISTORY_MAX);
-  writeUser(uid, { ...rec, pending: null, history });
-  return { ok: true };
 }
 
 /* ---------- admin test + boot recovery ---------- */
@@ -500,18 +529,17 @@ async function roundTrip(cfg, adapter, cred) {
     if (!check.ok) return { ok: false, error: check.error || 'the provider runtime could not be run' };
     const r = await adapter.invoke({
       cfg, jobDir, env, model: cfgStore.modelFor(cfg), timeoutMs: 90000, fetch: fetchFor(90000),
-      prompt: 'Reply with exactly this JSON object and nothing else: {"coach_contract":1,"ok":true}'
+      prompt: 'Reply with the single word: ok'
     });
     if (r.timedOut) return { ok: false, version: check.version, error: 'the provider did not answer in time' };
     if (r.code !== 0) {
       const err = (r.stderr || r.text || '').trim();
       return { ok: false, version: check.version, error: err.slice(0, 300) || 'the provider runtime exited with an error' };
     }
-    const parsed = extractJSON(r.text);
-    if (parsed.error || !parsed.value?.ok) {
-      return { ok: false, version: check.version, error: 'the provider answered, but not in the expected shape' };
-    }
-    return { ok: true, version: check.version };
+    if (!String(r.text || '').trim()) return { ok: false, version: check.version, error: 'the provider answered with nothing' };
+    // Whether this provider can run the assistant is a separate fact from whether it answers:
+    // the card says so, and the Coach screen says so before anybody types.
+    return { ok: true, version: check.version, assistant: adapter.tools === true };
   } finally {
     if (jobDir) removeJobDir(jobDir, unprivilegedIds());
   }
@@ -532,7 +560,9 @@ export function recoverOnBoot() {
       if (!rec.current) continue;
       writeUser(uid, {
         ...rec, current: null,
-        history: [...(rec.history || []), { id: rec.current.id, kind: rec.current.kind, outcome: 'failed', errorClass: 'restart', at: Date.now() }].slice(-HISTORY_MAX)
+        // The thread says so too: the person was waiting for an answer that is not coming.
+        chat: boundChat([...(rec.chat || []), errorMessage('restart')]), rev: (rec.rev || 0) + 1,
+        history: [...(rec.history || []), { id: rec.current.id, outcome: 'failed', errorClass: 'restart', at: Date.now() }].slice(-HISTORY_MAX)
       });
       n++;
     }

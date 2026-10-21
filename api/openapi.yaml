@@ -155,7 +155,7 @@ tags:
       404 when the instance runs with `MEDIA_UPLOADS=0`.
   - name: coach
     description: >-
-      AI Coach: plans, reviews and debriefs. Every route here answers 503 unless the
+      AI Coach: a chat assistant that looks things up in your own data and proposes edits. Every route here answers 503 unless the
       instance has the Coach switched on and a provider connected.
 
 security:
@@ -268,6 +268,12 @@ paths:
                       community:
                         type: boolean
                         description: Whether "compare with others" is offered on this instance.
+                      assistant:
+                        type: boolean
+                        description: >-
+                          Whether the configured provider can run the assistant, which is a tool loop.
+                          Only the Claude provider and the Anthropic API can; with anything else the
+                          Coach screen names the provider it needs instead of offering a chat.
                   password_login:
                     type: boolean
                     const: true
@@ -292,7 +298,7 @@ paths:
                   value:
                     invite_only: true
                     allow_guest: false
-                    coach: { enabled: true, provider: compatible, providerLabel: "OpenAI-compatible endpoint", authMode: instance, community: false }
+                    coach: { enabled: true, provider: claude, providerLabel: "Claude (Anthropic)", authMode: instance, community: false, assistant: true }
                 passwordLogin: { value: { invite_only: true, allow_guest: false, password_login: true } }
                 media: { value: { invite_only: false, allow_guest: true, media: { imageMB: 2, gifMB: 8, videoMB: 40, videoSec: 60, quotaMB: 200, workouts: true } } }
 
@@ -2443,9 +2449,12 @@ paths:
       operationId: getCoachDisclosure
       summary: What the consent screen must say
       description: |
-        The categories of data a Coach job would send, and the provider it would go to,
-        read straight from the module that builds the payload, so the consent screen
-        cannot drift from what actually leaves the box.
+        The categories of data the assistant can reach, and the provider it talks to, read
+        straight from the module that defines them, so the consent screen cannot drift from
+        what can actually leave the box.
+
+        Nothing is sent up front. The assistant asks for what a question needs one tool call
+        at a time, each bound to the profile that asked, and `flow: tools` says so.
 
         Needs a session but *not* a connected Coach: the screen that collects consent
         runs before there is anything to consent to.
@@ -2461,25 +2470,27 @@ paths:
                   providerLabel: { type: string }
                   categories:
                     type: array
-                    items: { type: string, enum: [plan, training, bodyweight, profile, prefs] }
-                    description: The data categories a job may send. Nothing else ever is.
+                    items: { type: string, enum: [plan, training, bodyweight, profile, prefs, chat] }
+                    description: The data categories a tool may return, plus the chat itself. Nothing else ever is.
+                  flow: { type: string, enum: [tools], description: How the data moves, one tool call at a time. }
                   version: { type: integer, description: Disclosure version the consent is recorded against. }
               example:
-                provider: anthropic
-                providerLabel: Claude
-                categories: [plan, training, bodyweight, profile, prefs]
-                version: 1
+                provider: claude
+                providerLabel: Claude (Anthropic)
+                categories: [plan, training, bodyweight, profile, prefs, chat]
+                flow: tools
+                version: 2
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/coach/status:
     get:
       tags: [coach]
       operationId: getCoachStatus
-      summary: The running job, the waiting proposal and today's budget
+      summary: The running job, today's budget and whether the thread changed
       description: |
-        What the Coach screen polls. Also the only place a proposal past its 14-day
-        expiry is retired. A phone that stays closed never polls, so nothing else
-        would notice.
+        What the Coach screen polls. `chatRev` changes whenever the thread does (a reply, a
+        decision recorded from another device), so the client reads the thread only when it
+        has something new.
       responses:
         '200':
           description: This profile's Coach state.
@@ -2489,149 +2500,134 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '503': { $ref: '#/components/responses/CoachOff' }
 
-  /api/coach/plan:
-    post:
+  /api/coach/chat:
+    get:
       tags: [coach]
-      operationId: postCoachPlan
-      summary: Ask for a training plan
+      operationId: getCoachChat
+      summary: The conversation
       description: |
-        Queues a `create` job. With `intake` it builds a plan from the answers given on
-        the intake screen; with `refine` it reworks the proposal already waiting, in the
-        words of the person reading it. The answer is 202 and a job id; the result
-        arrives through `GET /api/coach/status`.
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                intake:
-                  $ref: '#/components/schemas/CoachIntake'
-                refine:
-                  type: string
-                  maxLength: 4000
-                  description: |
-                    A change asked for in plain words, applied to the proposal now waiting. Cut to
-                    the instance's `maxMessageLen` (1000 unless the admin changed it; 200–4000).
-                lang:
-                  type: string
-                  pattern: '^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,8})?$'
-                  description: |
-                    The language the app is showing, which the Coach writes in. Absent or not a
-                    language tag, the profile's stored `lang` is used.
-            example: { intake: { goal: muscle, experience: novice, daysPerWeek: 3, equipment: [dumbbell, barbell] } }
-      responses:
-        '202': { $ref: '#/components/responses/CoachJobQueued' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/CoachRefused' }
-        '409': { $ref: '#/components/responses/CoachRefused' }
-        '429': { $ref: '#/components/responses/CoachRefused' }
-        '503': { $ref: '#/components/responses/CoachOff' }
-
-  /api/coach/review:
-    post:
-      tags: [coach]
-      operationId: postCoachReview
-      summary: Ask for a review of the training since the last one
-      description: |
-        Queues a `review` job, the same job the weekly cadence queues on its own. The
-        answer is either a change-set to accept or reject, or "nothing to change" with
-        the reason, both delivered through `GET /api/coach/status`.
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                note:
-                  type: string
-                  maxLength: 4000
-                  description: |
-                    Anything the profile wants the Coach to know this time round. Cut to the
-                    instance's `maxMessageLen` (1000 unless the admin changed it; 200–4000).
-                lang:
-                  type: string
-                  pattern: '^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,8})?$'
-                  description: |
-                    The language the app is showing, which the Coach writes in. Absent or not a
-                    language tag, the profile's stored `lang` is used.
-      responses:
-        '202': { $ref: '#/components/responses/CoachJobQueued' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/CoachRefused' }
-        '409': { $ref: '#/components/responses/CoachRefused' }
-        '429': { $ref: '#/components/responses/CoachRefused' }
-        '503': { $ref: '#/components/responses/CoachOff' }
-
-  /api/coach/debrief:
-    post:
-      tags: [coach]
-      operationId: postCoachDebrief
-      summary: Ask for a read of one session
-      description: |
-        Queues a `debrief` job: one workout, read closely. It changes nothing; the card
-        it produces is kept in the profile's log. With no `workoutId` the most recent
-        session is read.
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                workoutId:
-                  oneOf: [{ type: string, maxLength: 40 }, { type: 'null' }]
-                  description: The workout to read; null or absent means the latest.
-                lang:
-                  type: string
-                  pattern: '^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,8})?$'
-                  description: |
-                    The language the app is showing, which the Coach writes in. Absent or not a
-                    language tag, the profile's stored `lang` is used.
-      responses:
-        '202': { $ref: '#/components/responses/CoachJobQueued' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/CoachRefused' }
-        '409': { $ref: '#/components/responses/CoachRefused' }
-        '429': { $ref: '#/components/responses/CoachRefused' }
-        '503': { $ref: '#/components/responses/CoachOff' }
-
-  /api/coach/pending/resolve:
-    post:
-      tags: [coach]
-      operationId: postCoachResolve
-      summary: Apply or discard the waiting proposal
-      description: |
-        The client applies the accepted changes to its own state and syncs them through
-        `PUT /api/data`; this only records the decision and clears the proposal. Sending
-        it when nothing is waiting is a no-op, not an error.
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                accepted:
-                  type: array
-                  items: { type: string }
-                  description: Ids of the changes the person kept.
-                rejected:
-                  type: array
-                  items: { type: string }
-                  description: Ids of the changes they turned down.
-                dismissed:
-                  type: boolean
-                  description: True when the whole proposal was thrown away unread.
+        The thread with the assistant, oldest first, at most 60 messages. It lives on the
+        server in the profile's own Coach record, not in the synced state, so every device
+        reads the same one and a stale device cannot overwrite it. A proposal nobody answered
+        for 14 days reads `expired`; only the newest few proposals carry their `changes`, older
+        ones keep their summary, a `count` and what became of them.
       responses:
         '200':
-          description: Recorded; the proposal is cleared.
+          description: The thread.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Ok' }
+              schema:
+                type: object
+                properties:
+                  chat:
+                    type: array
+                    items: { $ref: '#/components/schemas/CoachMessage' }
+                  chatRev: { type: integer, description: The revision `GET /api/coach/status` reports. }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/CoachOff' }
+
+  /api/coach/message:
+    post:
+      tags: [coach]
+      operationId: postCoachMessage
+      summary: Say something to the assistant
+      description: |
+        One message is one job. The user's line joins the thread at once; the answer (plain
+        prose, and a proposal when it suggests edits) joins it when the job ends, and the
+        status poll says when. The model gets the last twenty turns, each cut to 1500 characters,
+        with what happened to any proposal in them.
+
+        The assistant never edits anything: its `propose_changes` tool records a proposal that
+        the client applies as ordinary local edits after a tap. It needs a provider that can run
+        a tool loop; with another one the answer is 409 `tools`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  maxLength: 4000
+                  description: |
+                    The message. Cut to the instance's `maxMessageLen` (1000 unless the admin
+                    changed it; 200-4000). Empty is refused.
+                lang:
+                  type: string
+                  pattern: '^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,8})?$'
+                  description: |
+                    The language the app is showing, which the assistant answers in unless the
+                    message is written in another. Absent or not a language tag, the profile's
+                    stored `lang` is used.
+            example: { text: "Log my weight, 79.4 kg this morning.", lang: en }
+      responses:
+        '202':
+          description: Queued. The answer arrives in the thread.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job:
+                    type: object
+                    properties:
+                      id: { type: string, description: 16 hex characters. }
+                  message: { $ref: '#/components/schemas/CoachMessage' }
+        '400': { $ref: '#/components/responses/CoachRefused' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/CoachRefused' }
+        '409': { $ref: '#/components/responses/CoachRefused' }
+        '429': { $ref: '#/components/responses/CoachRefused' }
+        '503': { $ref: '#/components/responses/CoachOff' }
+
+  /api/coach/proposal/resolve:
+    post:
+      tags: [coach]
+      operationId: postCoachProposalResolve
+      summary: Record what the person did with a proposal
+      description: |
+        The client applies a proposal's changes to its own state and syncs them through
+        `PUT /api/data`; this only records the decision on the thread, so the next message can
+        say what became of it. Statuses move forward only: `pending` to `applied` or
+        `dismissed`, and `applied` to `undone`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, status]
+              properties:
+                id: { type: string, description: The proposal's id, from the thread. }
+                status: { type: string, enum: [applied, dismissed, undone] }
+      responses:
+        '200':
+          description: Recorded.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: true }
+                  status: { type: string }
+        '400':
+          description: Not one of the three statuses.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: No such proposal in this profile's thread.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: The proposal is already past that state (applied, dismissed, expired).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '503': { $ref: '#/components/responses/CoachOff' }
 
   /api/coach/cohort:
@@ -2914,7 +2910,7 @@ paths:
                   type: integer
                   minimum: 200
                   maximum: 4000
-                  description: How long a chat message, refinement or review note can be. Clamped into the range; not a number keeps the current value.
+                  description: How long a chat message can be. Clamped into the range; not a number keeps the current value.
             example: { enabled: true, provider: compatible, model: qwen3.8-27b, caps: { perProfileDaily: 10, instanceDaily: 0 } }
       responses:
         '200':
@@ -3157,25 +3153,15 @@ components:
               error: { type: string }
               code: { type: string, enum: [off] }
           example: { error: "the Coach is not set up on this instance", code: off }
-    CoachJobQueued:
-      description: >-
-        Queued. The job runs in the background; its outcome arrives through
-        `GET /api/coach/status`, which the client polls.
-      content:
-        application/json:
-          schema:
-            type: object
-            properties:
-              job:
-                type: object
-                properties:
-                  id: { type: string, description: 16 hex characters. }
-          example: { job: { id: "9f1c2d3e4a5b6c7d" } }
     CoachRefused:
       description: |
         The Coach will not take this job, and says which reason in `code`:
 
         - `busy` (409): a job for this profile is already running.
+        - `tools` (409): the configured provider cannot run the assistant (it needs the Claude
+          provider or the Anthropic API).
+        - `empty` (400): the message was empty.
+        - `account` (409): per-profile mode, and this profile has not connected its own account.
         - `shared` (409): instance mode, and the credential belongs to another profile.
         - `cap` (429): this profile's or the instance's daily limit is spent.
         - `consent` (403): no consent recorded for this profile.
@@ -3188,8 +3174,8 @@ components:
             type: object
             properties:
               error: { type: string }
-              code: { type: string, enum: [off, busy, cap, consent, shared, unprivileged] }
-          example: { error: "the Coach is already thinking about your training", code: busy }
+              code: { type: string, enum: [off, busy, tools, empty, cap, consent, shared, account, unprivileged] }
+          example: { error: "the assistant is already answering you", code: busy }
     TooManyRequests:
       description: >-
         Paused by the sign-in throttle (see *Throttling* in the description). The request
@@ -3839,115 +3825,106 @@ components:
             - type: object
               properties:
                 id: { type: string }
-                kind: { type: string, enum: [create, review, debrief] }
                 state: { type: string, enum: [queued, running] }
                 startedAt: { type: integer, description: Epoch ms. }
             - type: 'null'
           description: The job running now, or null. One at a time per profile.
-        pending:
-          oneOf:
-            - $ref: '#/components/schemas/CoachProposal'
-            - type: 'null'
         cap: { $ref: '#/components/schemas/CoachCap' }
+        chatRev:
+          type: integer
+          description: Changes whenever the thread does; the client reads `GET /api/coach/chat` when it moves.
+        assistant:
+          type: object
+          description: Whether the configured provider can run the assistant at all.
+          properties:
+            supported: { type: boolean }
+            provider: { type: string }
         maxMessageLen:
           type: integer
           minimum: 200
           maximum: 4000
           description: |
-            The longest note or refinement this instance keeps, in characters. It rides on the
-            poll so a chat that is already open follows an admin's change.
+            The longest message this instance keeps, in characters. It rides on the poll so a
+            chat that is already open follows an admin's change.
         last:
           oneOf:
             - type: object
-              description: How the most recent job ended, so the chat can say so in the Coach's own voice.
+              description: How the most recent job ended, so the chat can close a job that failed before the first poll.
               properties:
                 id: { type: string }
-                kind: { type: string, enum: [create, review, debrief] }
-                outcome: { type: string, enum: [ready, nochange, applied, dismissed, expired, failed] }
+                outcome: { type: string, enum: [ready, failed] }
                 errorClass:
                   oneOf: [{ type: string }, { type: 'null' }]
-                  description: e.g. `provider`, `unusable`, `restart`, `forgotten`, `consent`, `noworkout`.
+                  description: e.g. `provider`, `auth`, `timeout`, `unusable`, `restart`, `forgotten`, `consent`, `tools`.
                 at: { type: integer, description: Epoch ms. }
-                reading: { type: string, description: "Present on `nochange`: why there was nothing to change." }
             - type: 'null'
+
+    CoachMessage:
+      type: object
+      description: |
+        One line of the thread. A user message is `kind: text`. An assistant message is `text`
+        (prose, markdown allowed, plus an optional `proposal`) or `error` (the job failed;
+        `errorClass` says how, and the provider's own words never appear here).
+      properties:
+        id: { type: string }
+        role: { type: string, enum: [user, assistant] }
+        kind: { type: string, enum: [text, error] }
+        text: { type: string, maxLength: 8000 }
+        errorClass: { type: string, description: "Only on `error`." }
+        at: { type: integer, description: Epoch ms. }
+        proposal: { $ref: '#/components/schemas/CoachProposal' }
 
     CoachProposal:
       type: object
       description: |
-        The answer waiting for a decision, from whichever kind of job produced it. It
-        expires 14 days after it was made; the first status poll after that retires it.
-        `changes` comes from a review, `bundle` from a plan, `score`/`highlights` from a
-        debrief. One of the three, never more.
+        The edits the assistant suggests, checked on the server before they reach the thread
+        (every id exists, every target is there, every number is in range, the whole set applies
+        cleanly to a copy) and checked again on the client before it applies them. All or
+        nothing: Apply runs every change or none.
       properties:
-        id: { type: string, description: The job's id. }
-        kind: { type: string, enum: [create, review, debrief] }
-        createdAt: { type: integer, description: Epoch ms. }
-        expiresAt: { type: integer, description: Epoch ms. }
-        planHash: { type: string, description: The plan this was written against. A later edit makes it stale. }
-        iteration: { type: integer, description: "1, or higher after a refine." }
+        id: { type: string }
         summary: { type: string, maxLength: 1200 }
+        createdAt: { type: integer, description: Epoch ms. }
+        status: { type: string, enum: [pending, applied, dismissed, undone, expired] }
+        decidedAt: { type: integer }
         changes:
           type: array
-          description: A review's change-set, each one applied or rejected on its own.
+          description: Absent on an old proposal, which keeps `count` and `kinds` instead.
+          items: { $ref: '#/components/schemas/CoachChange' }
+        count: { type: integer, description: "Only on a proposal whose changes were dropped to keep the thread small." }
+        kinds: { type: array, items: { type: string } }
+
+    CoachChange:
+      type: object
+      description: |
+        One change. `type` is a member of a closed list: the eighteen plan types a plan review
+        always had, and twelve more (`dayplan`, `workout-add`, `workout-edit`, `workout-delete`,
+        `bodyweight-set`, `bodyweight-delete`, `exnote-set`, `custom-ex-add`, `custom-ex-edit`,
+        `custom-ex-delete`, `setting`, `profile-set`). A type not on the list does nothing.
+        `before` is read off the profile's state by the server, never taken from the model.
+        The weight unit, accounts, other profiles and the server itself are not on any list.
+      properties:
+        id: { type: string }
+        type:
+          type: string
+          enum: [add-exercise, remove-exercise, swap-exercise, sets, reps, repsMin, repsMax,
+                 sec, cardio, reorder, superset, routine-prog, exercise-prog, inc,
+                 add-routine, remove-routine, rename-routine, week,
+                 dayplan, workout-add, workout-edit, workout-delete, bodyweight-set, bodyweight-delete,
+                 exnote-set, custom-ex-add, custom-ex-edit, custom-ex-delete, setting, profile-set]
+        target: { type: object, additionalProperties: true, description: "What it is about: `routineId`, `exId`, `weekday`, `workoutId`, `date`, `key`." }
+        before: { description: What the data says now. The client checks it before applying. }
+        after: { description: What it would say. }
+        why: { type: string, maxLength: 600, description: The assistant's reason, shown on the card. }
+        lines:
+          type: array
+          description: Before and after as plain strings, for the card (the non-plan types).
           items:
             type: object
             properties:
-              id: { type: string }
-              type:
-                type: string
-                enum: [add-exercise, remove-exercise, swap-exercise, sets, reps, repsMin, repsMax,
-                       sec, cardio, reorder, superset, routine-prog, exercise-prog, inc,
-                       add-routine, remove-routine, rename-routine, week]
-              why: { type: string }
-              before: { description: What the plan says now. The client checks it before applying. }
-              after: { description: What it would say. }
-            additionalProperties: true
-        evidence:
-          type: object
-          description: The window the review read.
-          properties:
-            from: { oneOf: [{ type: string }, { type: 'null' }] }
-            to: { oneOf: [{ type: string }, { type: 'null' }] }
-            sessions: { oneOf: [{ type: integer }, { type: 'null' }] }
-        notes:
-          type: array
-          items: { type: string }
-        bundle:
-          type: object
-          description: A whole plan, from a `create` job (routines, week and any custom exercises).
-          properties:
-            opengym_plan: { type: integer, const: 1 }
-            name: { type: string, maxLength: 40 }
-            summary: { type: string }
-            basedOn: { type: string }
-            week: { type: object }
-            routines: { type: array, items: { type: object } }
-            customEx: { type: array, items: { type: object } }
-          additionalProperties: true
-        score: { type: integer, minimum: 1, maximum: 10, description: A debrief's score for the session. }
-        highlights: { type: array, items: { type: string } }
-        watch: { type: array, items: { type: string } }
-        nextTime: { type: array, items: { type: string } }
-        workout:
-          type: object
-          description: Which session a debrief read.
-          additionalProperties: true
-      additionalProperties: true
-
-    CoachIntake:
-      type: object
-      description: >-
-        The intake answers, as the plan screen collects them. Stored in the profile's own
-        state as well; sent here so a plan can be asked for with answers that have not
-        been synced yet.
-      properties:
-        goal: { type: string, description: "e.g. `muscle`, `strength`, `fat-loss`." }
-        experience: { type: string }
-        daysPerWeek: { type: integer }
-        preferredDays: { type: array, items: { type: integer }, description: 0 = Sunday. }
-        sessionMin: { type: integer, description: Minutes per session. }
-        equipment: { type: array, items: { type: string } }
-        limitations: { type: string, description: Injuries and anything to work around. }
+              k: { type: string }
+              before: { oneOf: [{ type: string }, { type: 'null' }] }
+              after: { oneOf: [{ type: string }, { type: 'null' }] }
       additionalProperties: true
 
     CoachCohort:
@@ -3988,6 +3965,7 @@ components:
       description: The whole admin card in one answer. Never a credential, only whether one is filed.
       properties:
         disabledByEnv: { type: boolean, description: "COACH_DISABLED is set, so nothing the admin toggles matters." }
+        assistant: { type: boolean, description: "Whether the configured provider can run the assistant (a tool loop): the Claude provider and the Anthropic API can, the others cannot." }
         enabled: { type: boolean }
         provider: { type: string }
         providers:
@@ -4019,7 +3997,7 @@ components:
           properties:
             perProfileDaily: { type: integer }
             instanceDaily: { type: integer }
-        maxMessageLen: { type: integer, description: 'How long a chat message, refinement or review note can be (200–4000, default 1000).' }
+        maxMessageLen: { type: integer, description: 'How long a chat message can be (200–4000, default 1000).' }
         community: { type: boolean }
         runtime:
           type: object
@@ -4065,7 +4043,7 @@ components:
             type: object
             properties:
               at: { type: string, format: date-time }
-              kind: { type: string }
+              kind: { type: string, description: "`chat` for a message; older entries may read `create`, `review`, `debrief`." }
               trigger: { type: string, enum: [manual, scheduled] }
               outcome: { type: string }
               errorClass: { oneOf: [{ type: string }, { type: 'null' }] }

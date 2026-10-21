@@ -28,6 +28,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { HTTP_PROVIDERS, baseUrlFor } from './core/providers.js';
 import { MAX_OUTPUT_TOKENS } from './core/adapters/http.js';
+import { adapterFor } from './adapters/index.js';
 
 const DATA = process.env.DATA_DIR || '/data';
 const FILE = path.join(DATA, 'coach.json');
@@ -381,7 +382,12 @@ export function isConnected() {
 export function publicConfig() {
   if (!isEnabled() || !isConnected()) return null;
   const cfg = load();
-  return { enabled: true, provider: cfg.provider, providerLabel: providerMeta(cfg).label, authMode: cfg.authMode, community: !!cfg.community };
+  return {
+    enabled: true, provider: cfg.provider, providerLabel: providerMeta(cfg).label, authMode: cfg.authMode, community: !!cfg.community,
+    // Whether the configured provider can run the assistant's tool loop. The Coach screen says
+    // which provider it needs when this is false, instead of offering a chat that cannot answer.
+    assistant: adapterFor(cfg.provider)?.tools === true
+  };
 }
 
 /**
